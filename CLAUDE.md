@@ -6,7 +6,7 @@ An automated pipeline that fetches a Trading 212 portfolio via their REST API, a
 ## Stack
 - Language: Python 3.12
 - Package manager: pip + `requirements.txt`
-- Key libraries: `httpx` (API calls), `google-api-python-client` (Drive), `anthropic` (Claude API)
+- Key libraries: `httpx` (API calls), `google-api-python-client` (Drive), `google-generativeai` (Gemini API)
 - Scheduler: GitHub Actions (cron)
 - Secrets store: GitHub Actions Secrets (never `.env` files in repo)
 
