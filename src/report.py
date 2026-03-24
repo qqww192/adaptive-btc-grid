@@ -52,6 +52,52 @@ def _get_credentials() -> service_account.Credentials:
     return creds
 
 
+def _find_existing_report_doc(drive_service) -> Optional[str]:
+    """
+    Search for an existing 'T212 Portfolio Reports' Google Doc owned by this
+    service account. Returns the doc ID if found, None otherwise.
+    """
+    try:
+        results = drive_service.files().list(
+            q="name = 'T212 Portfolio Reports' and mimeType = 'application/vnd.google-apps.document' and trashed = false",
+            fields="files(id)",
+            pageSize=1,
+        ).execute()
+        files = results.get("files", [])
+        if files:
+            return files[0]["id"]
+    except HttpError as e:
+        log.warning("Failed to search for existing report doc: %s", e)
+    return None
+
+
+def _empty_trash(drive_service) -> None:
+    """Attempt to empty the service account's Drive trash to reclaim quota."""
+    try:
+        drive_service.files().emptyTrash().execute()
+        log.info("Emptied Drive trash to reclaim storage quota.")
+    except HttpError as e:
+        log.warning("Failed to empty Drive trash: %s", e)
+
+
+def _create_doc(drive_service, file_metadata: dict) -> dict:
+    """Create a doc, retrying once after emptying trash if quota is exceeded."""
+    try:
+        return drive_service.files().create(
+            body=file_metadata,
+            fields="id",
+        ).execute()
+    except HttpError as exc:
+        if exc.resp.status == 403 and "storageQuotaExceeded" in str(exc):
+            log.warning("Storage quota exceeded — emptying trash and retrying.")
+            _empty_trash(drive_service)
+            return drive_service.files().create(
+                body=file_metadata,
+                fields="id",
+            ).execute()
+        raise
+
+
 def _get_or_create_doc(docs_service, drive_service, run_date: str) -> str:
     """
     Returns the master doc ID. Creates the doc if MASTER_DOC_ID is not set.
@@ -64,11 +110,17 @@ def _get_or_create_doc(docs_service, drive_service, run_date: str) -> str:
         except HttpError as e:
             log.warning(
                 "GOOGLE_DOC_ID '%s' is not accessible (%s). "
-                "Will create a new document instead.",
+                "Will try to find or create a document instead.",
                 MASTER_DOC_ID, e,
             )
 
-    log.info("GOOGLE_DOC_ID not set — creating a new master document.")
+    # Before creating a new doc, check if one already exists from a previous run
+    existing_id = _find_existing_report_doc(drive_service)
+    if existing_id:
+        log.info("Found existing report doc %s — reusing it.", existing_id)
+        return existing_id
+
+    log.info("No existing report doc found — creating a new master document.")
 
     # Create the doc via Drive API (more permissive than Docs API create)
     file_metadata = {
@@ -79,17 +131,8 @@ def _get_or_create_doc(docs_service, drive_service, run_date: str) -> str:
         file_metadata["parents"] = [REPORT_FOLDER_ID]
 
     try:
-        file = drive_service.files().create(
-            body=file_metadata,
-            fields="id",
-        ).execute()
+        file = _create_doc(drive_service, file_metadata)
     except HttpError as exc:
-        if exc.resp.status == 403 and "storageQuotaExceeded" in str(exc):
-            raise RuntimeError(
-                "Google Drive storage quota exceeded for the service account. "
-                "Free up space or use a different account. "
-                "See docs/setup.md for details."
-            ) from exc
         if REPORT_FOLDER_ID:
             log.warning(
                 "Failed to create doc in folder %s (%s). "
@@ -97,19 +140,7 @@ def _get_or_create_doc(docs_service, drive_service, run_date: str) -> str:
                 REPORT_FOLDER_ID, exc,
             )
             file_metadata.pop("parents", None)
-            try:
-                file = drive_service.files().create(
-                    body=file_metadata,
-                    fields="id",
-                ).execute()
-            except HttpError as inner_exc:
-                if inner_exc.resp.status == 403 and "storageQuotaExceeded" in str(inner_exc):
-                    raise RuntimeError(
-                        "Google Drive storage quota exceeded for the service account. "
-                        "Free up space or use a different account. "
-                        "See docs/setup.md for details."
-                    ) from inner_exc
-                raise
+            file = _create_doc(drive_service, file_metadata)
         else:
             raise
     doc_id: str = file["id"]
