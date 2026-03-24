@@ -1,0 +1,57 @@
+name: Portfolio Check
+
+on:
+  # ── Scheduled runs ──────────────────────────────────────────────────────────
+  # Edit the cron expression below to set your preferred schedule.
+  # Format: minute hour day-of-month month day-of-week (all UTC)
+  #
+  # Examples:
+  #   '0 7 * * 1'       → every Monday at 07:00 UTC
+  #   '0 8 * * 1,3,5'   → Mon / Wed / Fri at 08:00 UTC
+  #   '0 7 * * 1-5'     → every weekday at 07:00 UTC
+  #   '0 7 1 * *'       → first day of every month at 07:00 UTC
+  #
+  schedule:
+    - cron: '0 7 * * 1'   # ← CHANGE THIS to your preferred schedule
+
+  # ── Manual trigger (useful for testing) ─────────────────────────────────────
+  workflow_dispatch:
+
+jobs:
+  portfolio-check:
+    name: Fetch → Analyse → Report
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run portfolio checker
+        env:
+          T212_API_KEY: ${{ secrets.T212_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
+          GOOGLE_DOC_ID: ${{ secrets.GOOGLE_DOC_ID }}
+          GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
+        run: |
+          cd src
+          python main.py
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failure-logs-${{ github.run_id }}
+          path: |
+            *.log
+          retention-days: 7
