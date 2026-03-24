@@ -21,12 +21,21 @@ TIMEOUT = 30  # seconds
 
 def _get_headers() -> dict[str, str]:
     api_key = os.environ.get("T212_API_KEY", "")
+    secret_key = os.environ.get("T212_SECRET_KEY", "")
     if not api_key:
         raise EnvironmentError(
             "T212_API_KEY environment variable is not set. "
             "See docs/setup.md for how to obtain and configure it."
         )
-    return {"Authorization": api_key}
+    if not secret_key:
+        raise EnvironmentError(
+            "T212_SECRET_KEY environment variable is not set. "
+            "See docs/setup.md for how to obtain and configure it."
+        )
+    return {
+        "Authorization": api_key,
+        "X-Secret-Key": secret_key,
+    }
 
 
 def fetch_all_positions() -> list[dict[str, Any]]:
