@@ -13,7 +13,7 @@ import google.generativeai as genai
 
 log = logging.getLogger(__name__)
 
-MODEL = "gemini-1.5-flash"
+MODEL = "gemini-2.5-flash"
 
 
 def _get_client() -> None:

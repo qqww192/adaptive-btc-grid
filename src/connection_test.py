@@ -56,7 +56,7 @@ def test_gemini_connection() -> bool:
     try:
         import google.generativeai as genai
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        model = genai.GenerativeModel("gemini-2.5-flash")
         response = model.generate_content("Say 'connection OK' in one word.")
         log.info(f"  PASS — Gemini connected. Response: {response.text.strip()}")
         return True
@@ -75,7 +75,7 @@ def test_gemini_news_scan() -> bool:
     try:
         import google.generativeai as genai
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        model = genai.GenerativeModel("gemini-2.5-flash")
         prompt = (
             "You are a financial news scanner. Return a single-line test response: "
             "'News scan OK — no alerts today.'"
@@ -99,7 +99,7 @@ def test_gemini_portfolio_analysis() -> bool:
     try:
         import google.generativeai as genai
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        model = genai.GenerativeModel("gemini-2.5-flash")
         prompt = (
             "Analyse this sample portfolio in one sentence:\n"
             "AAPL: 10 shares at $150, MSFT: 5 shares at $300.\n"
