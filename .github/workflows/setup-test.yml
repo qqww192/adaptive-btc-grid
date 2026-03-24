@@ -1,0 +1,36 @@
+name: Setup Test
+
+on:
+  workflow_dispatch:   # manual trigger only
+
+jobs:
+  test-setup:
+    name: Create Sheet & Sync Portfolio
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: claude/review-and-rename-file-8yEKW
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run setup test
+        env:
+          T212_API_KEY: ${{ secrets.T212_API_KEY }}
+          T212_SECRET_KEY: ${{ secrets.T212_SECRET_KEY }}
+          GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
+        run: |
+          cd src
+          python test_setup.py
