@@ -6,6 +6,7 @@ API docs: https://t212public-api-docs.trading212.com/
 Rate limit: respect the API's rate limits — never call in a tight loop without the cursor.
 """
 
+import base64
 import os
 import logging
 import time
@@ -32,9 +33,9 @@ def _get_headers() -> dict[str, str]:
             "T212_SECRET_KEY environment variable is not set. "
             "See docs/setup.md for how to obtain and configure it."
         )
+    credentials = base64.b64encode(f"{api_key}:{secret_key}".encode()).decode()
     return {
-        "Authorization": api_key,
-        "X-Secret-Key": secret_key,
+        "Authorization": f"Basic {credentials}",
     }
 
 

@@ -2,6 +2,7 @@
 Tests for fetch_portfolio.py
 """
 
+import base64
 import os
 import sys
 import pytest
@@ -27,12 +28,13 @@ class TestGetHeaders:
     def test_both_keys_present(self):
         with patch.dict(os.environ, {"T212_API_KEY": "key123", "T212_SECRET_KEY": "secret456"}, clear=True):
             headers = _get_headers()
-            assert headers["Authorization"] == "key123"
-            assert headers["X-Secret-Key"] == "secret456"
+            expected = base64.b64encode(b"key123:secret456").decode()
+            assert headers["Authorization"] == f"Basic {expected}"
+            assert "X-Secret-Key" not in headers
 
 
 class TestFetchAllPositions:
-    @patch("fetch_portfolio._get_headers", return_value={"Authorization": "k", "X-Secret-Key": "s"})
+    @patch("fetch_portfolio._get_headers", return_value={"Authorization": "Basic dGVzdDp0ZXN0"})
     @patch("fetch_portfolio.httpx.Client")
     def test_successful_fetch(self, mock_client_cls, mock_headers):
         mock_response = MagicMock()
@@ -53,7 +55,7 @@ class TestFetchAllPositions:
         assert positions[0]["ticker"] == "AAPL"
         assert positions[1]["ticker"] == "MSFT"
 
-    @patch("fetch_portfolio._get_headers", return_value={"Authorization": "k", "X-Secret-Key": "s"})
+    @patch("fetch_portfolio._get_headers", return_value={"Authorization": "Basic dGVzdDp0ZXN0"})
     @patch("fetch_portfolio.httpx.Client")
     def test_empty_portfolio(self, mock_client_cls, mock_headers):
         mock_response = MagicMock()

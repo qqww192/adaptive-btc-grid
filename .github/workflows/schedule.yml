@@ -12,14 +12,14 @@ on:
   #   '0 7 1 * *'       → first day of every month at 07:00 UTC
   #
   schedule:
-    - cron: '0 7 * * 1'   # ← CHANGE THIS to your preferred schedule
+    - cron: '0 7 * * *'   # every day at 07:00 UTC
 
   # ── Manual trigger (useful for testing) ─────────────────────────────────────
   workflow_dispatch:
 
 jobs:
   portfolio-check:
-    name: Fetch → Analyse → Report
+    name: Daily Portfolio Analysis
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -42,7 +42,7 @@ jobs:
           T212_SECRET_KEY: ${{ secrets.T212_SECRET_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
-          GOOGLE_DOC_ID: ${{ secrets.GOOGLE_DOC_ID }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
         run: |
           cd src

@@ -31,7 +31,13 @@ from google.generativeai import protos
 
 log = logging.getLogger(__name__)
 
-genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+_api_key = os.environ.get("GEMINI_API_KEY", "")
+if not _api_key:
+    raise EnvironmentError(
+        "GEMINI_API_KEY environment variable is not set. "
+        "See docs/setup.md for how to obtain and configure it."
+    )
+genai.configure(api_key=_api_key)
 MODEL = "gemini-2.0-flash"
 SEARCH_TOOL = Tool(google_search=protos.GoogleSearch())
 

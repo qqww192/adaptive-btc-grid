@@ -7,8 +7,11 @@ Separate from main.py so the two pipelines can run on independent schedules.
 import os
 import sys
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
+
+# Ensure src/ modules (fetch_portfolio, report) are importable
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
 from fetch_portfolio import fetch_all_positions
 from news_alert import scan_for_alerts, send_telegram_alerts, format_alert_for_doc
@@ -26,7 +29,7 @@ def main() -> None:
     load_dotenv()
 
     log.info("=== Daily News Alert Scanner starting ===")
-    scan_date = datetime.utcnow().strftime("%Y-%m-%d")
+    scan_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     # Step 1: get current holdings so Claude knows which ETFs to monitor
     log.info("Fetching current portfolio...")

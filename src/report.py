@@ -52,28 +52,98 @@ def _get_credentials() -> service_account.Credentials:
     return creds
 
 
+def _find_existing_report_doc(drive_service) -> Optional[str]:
+    """
+    Search for an existing 'T212 Portfolio Reports' Google Doc owned by this
+    service account. Returns the doc ID if found, None otherwise.
+    """
+    try:
+        results = drive_service.files().list(
+            q="name = 'T212 Portfolio Reports' and mimeType = 'application/vnd.google-apps.document' and trashed = false",
+            fields="files(id)",
+            pageSize=1,
+        ).execute()
+        files = results.get("files", [])
+        if files:
+            return files[0]["id"]
+    except HttpError as e:
+        log.warning("Failed to search for existing report doc: %s", e)
+    return None
+
+
+def _empty_trash(drive_service) -> None:
+    """Attempt to empty the service account's Drive trash to reclaim quota."""
+    try:
+        drive_service.files().emptyTrash().execute()
+        log.info("Emptied Drive trash to reclaim storage quota.")
+    except HttpError as e:
+        log.warning("Failed to empty Drive trash: %s", e)
+
+
+def _create_doc(drive_service, file_metadata: dict) -> dict:
+    """Create a doc, retrying once after emptying trash if quota is exceeded."""
+    try:
+        return drive_service.files().create(
+            body=file_metadata,
+            fields="id",
+        ).execute()
+    except HttpError as exc:
+        if exc.resp.status == 403 and "storageQuotaExceeded" in str(exc):
+            log.warning("Storage quota exceeded — emptying trash and retrying.")
+            _empty_trash(drive_service)
+            return drive_service.files().create(
+                body=file_metadata,
+                fields="id",
+            ).execute()
+        raise
+
+
 def _get_or_create_doc(docs_service, drive_service, run_date: str) -> str:
     """
     Returns the master doc ID. Creates the doc if MASTER_DOC_ID is not set.
     """
     if MASTER_DOC_ID:
-        return MASTER_DOC_ID
+        # Validate the doc still exists / is accessible before using it
+        try:
+            docs_service.documents().get(documentId=MASTER_DOC_ID).execute()
+            return MASTER_DOC_ID
+        except HttpError as e:
+            log.warning(
+                "GOOGLE_DOC_ID '%s' is not accessible (%s). "
+                "Will try to find or create a document instead.",
+                MASTER_DOC_ID, e,
+            )
 
-    log.info("GOOGLE_DOC_ID not set — creating a new master document.")
-    body = {"title": "T212 Portfolio Reports"}
+    # Before creating a new doc, check if one already exists from a previous run
+    existing_id = _find_existing_report_doc(drive_service)
+    if existing_id:
+        log.info("Found existing report doc %s — reusing it.", existing_id)
+        return existing_id
 
-    # Create the doc
-    doc = docs_service.documents().create(body=body).execute()
-    doc_id: str = doc["documentId"]
+    log.info("No existing report doc found — creating a new master document.")
 
-    # Move to folder if specified
+    # Create the doc via Drive API (more permissive than Docs API create)
+    file_metadata = {
+        "name": "T212 Portfolio Reports",
+        "mimeType": "application/vnd.google-apps.document",
+    }
     if REPORT_FOLDER_ID:
-        drive_service.files().update(
-            fileId=doc_id,
-            addParents=REPORT_FOLDER_ID,
-            removeParents="root",
-            fields="id, parents",
-        ).execute()
+        file_metadata["parents"] = [REPORT_FOLDER_ID]
+
+    try:
+        file = _create_doc(drive_service, file_metadata)
+    except HttpError as exc:
+        if REPORT_FOLDER_ID:
+            log.warning(
+                "Failed to create doc in folder %s (%s). "
+                "Retrying without folder (service-account root).",
+                REPORT_FOLDER_ID, exc,
+            )
+            file_metadata.pop("parents", None)
+            file = _create_doc(drive_service, file_metadata)
+        else:
+            raise
+    doc_id: str = file["id"]
 
     log.info(
         f"\n{'='*60}\n"
