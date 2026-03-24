@@ -6,7 +6,7 @@ Runs the full pipeline: fetch → analyse → report
 import os
 import sys
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 from fetch_portfolio import fetch_all_positions
@@ -26,7 +26,7 @@ def main() -> None:
     load_dotenv()  # no-op in GitHub Actions (secrets injected as env vars)
 
     log.info("=== T212 Portfolio Checker starting ===")
-    run_date = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    run_date = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     # ── Step 1: Fetch portfolio ───────────────────────────────────────────────
     log.info("Step 1 — Fetching portfolio from Trading 212...")

@@ -2,29 +2,29 @@
 analyse.py
 Sends the portfolio data to Google Gemini for analysis and returns a markdown report.
 
-Uses the google-generativeai SDK with Search grounding for up-to-date market context.
+Uses the google-genai SDK with Search grounding for up-to-date market context.
 """
 
 import os
 import logging
 from typing import Any
 
-import google.generativeai as genai
+from google import genai
 
 log = logging.getLogger(__name__)
 
 MODEL = "gemini-2.5-flash"
 
 
-def _get_client() -> None:
-    """Configure the Gemini SDK with the API key."""
+def _get_client() -> genai.Client:
+    """Create and return a Gemini client configured with the API key."""
     api_key = os.environ.get("GEMINI_API_KEY", "")
     if not api_key:
         raise EnvironmentError(
             "GEMINI_API_KEY environment variable is not set. "
             "See docs/setup.md for how to obtain and configure it."
         )
-    genai.configure(api_key=api_key)
+    return genai.Client(api_key=api_key)
 
 
 def _build_prompt(positions: list[dict[str, Any]], run_date: str) -> str:
@@ -68,12 +68,11 @@ def analyse_portfolio(positions: list[dict[str, Any]], run_date: str) -> str:
     Sends portfolio data to Gemini for analysis.
     Returns the analysis as a markdown string.
     """
-    _get_client()
+    client = _get_client()
 
     prompt = _build_prompt(positions, run_date)
 
-    model = genai.GenerativeModel(MODEL)
-    response = model.generate_content(prompt)
+    response = client.models.generate_content(model=MODEL, contents=prompt)
 
     report = response.text
     log.info(f"Gemini analysis complete — {len(report)} chars.")
