@@ -39,6 +39,7 @@ jobs:
       - name: Run portfolio checker
         env:
           T212_API_KEY: ${{ secrets.T212_API_KEY }}
+          T212_SECRET_KEY: ${{ secrets.T212_SECRET_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
           GOOGLE_DOC_ID: ${{ secrets.GOOGLE_DOC_ID }}

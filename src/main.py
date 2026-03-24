@@ -36,8 +36,8 @@ def main() -> None:
         sys.exit(0)
     log.info(f"  {len(positions)} positions fetched.")
 
-    # ── Step 2: Analyse with Claude ──────────────────────────────────────────
-    log.info("Step 2 — Analysing portfolio with Claude...")
+    # ── Step 2: Analyse with Gemini ──────────────────────────────────────────
+    log.info("Step 2 — Analysing portfolio with Gemini...")
     report_markdown = analyse_portfolio(positions, run_date)
     log.info("  Analysis complete.")
 
