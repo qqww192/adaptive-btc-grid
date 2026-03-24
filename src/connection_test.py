@@ -121,7 +121,7 @@ def test_gemini_portfolio_analysis() -> bool:
 
 
 def test_google_drive_connection() -> bool:
-    """Test Google Drive/Docs API connectivity."""
+    """Test Google Drive/Docs/Sheets API connectivity including write permissions."""
     sa_json = os.environ.get("GOOGLE_SA_JSON", "")
     if not sa_json:
         log.error("  FAIL — GOOGLE_SA_JSON not set.")
@@ -130,32 +130,89 @@ def test_google_drive_connection() -> bool:
     try:
         from google.oauth2 import service_account
         from googleapiclient.discovery import build
+        from googleapiclient.errors import HttpError
 
         sa_dict = json.loads(sa_json)
         scopes = [
             "https://www.googleapis.com/auth/drive",
             "https://www.googleapis.com/auth/documents",
+            "https://www.googleapis.com/auth/spreadsheets",
         ]
         creds = service_account.Credentials.from_service_account_info(sa_dict, scopes=scopes)
-        drive_service = build("drive", "v3", credentials=creds)
 
-        # Simple test: list files (limit 1) to verify auth works
+        # --- Step A: Drive API — list files (read test) ---
+        drive_service = build("drive", "v3", credentials=creds)
         results = drive_service.files().list(pageSize=1, fields="files(id, name)").execute()
         files = results.get("files", [])
-        log.info(f"  PASS — Google Drive connected. {len(files)} file(s) visible to service account.")
+        log.info(f"  PASS — Drive API read: {len(files)} file(s) visible to service account.")
 
-        # If GOOGLE_DOC_ID is set, verify access to the master doc
-        doc_id = os.environ.get("GOOGLE_DOC_ID", "")
-        if doc_id:
+        # --- Step B: Drive API — create and delete a temp file (write test) ---
+        test_file = None
+        try:
+            test_file = drive_service.files().create(
+                body={"name": "__connection_test_temp__", "mimeType": "application/vnd.google-apps.document"},
+                fields="id",
+            ).execute()
+            log.info(f"  PASS — Drive API write: created test doc (id={test_file['id']}).")
+        except HttpError as e:
+            log.error(f"  FAIL — Drive API write: cannot create files: {e}")
+            log.error("         Check: Google Drive API enabled? Service account has Editor/Owner role?")
+            return False
+        finally:
+            # Always clean up the temp file
+            if test_file:
+                try:
+                    drive_service.files().delete(fileId=test_file["id"]).execute()
+                    log.info("  OK   — Cleaned up test doc.")
+                except HttpError:
+                    log.warning(f"  WARN — Could not delete test doc {test_file['id']}; delete it manually.")
+
+        # --- Step C: Docs API — verify the API is reachable ---
+        try:
             docs_service = build("docs", "v1", credentials=creds)
-            doc = docs_service.documents().get(documentId=doc_id).execute()
-            log.info(f"  PASS — Master Google Doc accessible: '{doc.get('title', 'Untitled')}'")
-        else:
-            log.info("  SKIP — GOOGLE_DOC_ID not set (will be created on first run).")
+            # If GOOGLE_DOC_ID is set, verify access to the master doc
+            doc_id = os.environ.get("GOOGLE_DOC_ID", "")
+            if doc_id:
+                doc = docs_service.documents().get(documentId=doc_id).execute()
+                log.info(f"  PASS — Docs API: master doc accessible: '{doc.get('title', 'Untitled')}'")
+            else:
+                # Create a throwaway doc via Docs API to confirm it works, then delete via Drive
+                temp_doc = docs_service.documents().create(body={"title": "__docs_api_test__"}).execute()
+                temp_doc_id = temp_doc["documentId"]
+                log.info(f"  PASS — Docs API write: created test doc (id={temp_doc_id}).")
+                try:
+                    drive_service.files().delete(fileId=temp_doc_id).execute()
+                    log.info("  OK   — Cleaned up Docs API test doc.")
+                except HttpError:
+                    log.warning(f"  WARN — Could not delete Docs test doc {temp_doc_id}; delete it manually.")
+        except HttpError as e:
+            log.error(f"  FAIL — Docs API error: {e}")
+            log.error("         Check: Google Docs API enabled in Cloud Console?")
+            return False
 
+        # --- Step D: Sheets API — verify the API is reachable ---
+        try:
+            sheets_service = build("sheets", "v4", credentials=creds)
+            temp_sheet = sheets_service.spreadsheets().create(
+                body={"properties": {"title": "__sheets_api_test__"}},
+                fields="spreadsheetId",
+            ).execute()
+            temp_sheet_id = temp_sheet["spreadsheetId"]
+            log.info(f"  PASS — Sheets API write: created test sheet (id={temp_sheet_id}).")
+            try:
+                drive_service.files().delete(fileId=temp_sheet_id).execute()
+                log.info("  OK   — Cleaned up Sheets API test sheet.")
+            except HttpError:
+                log.warning(f"  WARN — Could not delete test sheet {temp_sheet_id}; delete it manually.")
+        except HttpError as e:
+            log.error(f"  FAIL — Sheets API error: {e}")
+            log.error("         Check: Google Sheets API enabled in Cloud Console?")
+            return False
+
+        log.info("  PASS — All Google API write permissions verified.")
         return True
     except Exception as e:
-        log.error(f"  FAIL — Google Drive error: {e}")
+        log.error(f"  FAIL — Google API error: {e}")
         return False
 
 
