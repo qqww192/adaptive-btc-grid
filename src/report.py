@@ -57,7 +57,16 @@ def _get_or_create_doc(docs_service, drive_service, run_date: str) -> str:
     Returns the master doc ID. Creates the doc if MASTER_DOC_ID is not set.
     """
     if MASTER_DOC_ID:
-        return MASTER_DOC_ID
+        # Validate the doc still exists / is accessible before using it
+        try:
+            docs_service.documents().get(documentId=MASTER_DOC_ID).execute()
+            return MASTER_DOC_ID
+        except HttpError as e:
+            log.warning(
+                "GOOGLE_DOC_ID '%s' is not accessible (%s). "
+                "Will create a new document instead.",
+                MASTER_DOC_ID, e,
+            )
 
     log.info("GOOGLE_DOC_ID not set — creating a new master document.")
 
@@ -74,7 +83,13 @@ def _get_or_create_doc(docs_service, drive_service, run_date: str) -> str:
             body=file_metadata,
             fields="id",
         ).execute()
-    except Exception as exc:
+    except HttpError as exc:
+        if exc.resp.status == 403 and "storageQuotaExceeded" in str(exc):
+            raise RuntimeError(
+                "Google Drive storage quota exceeded for the service account. "
+                "Free up space or use a different account. "
+                "See docs/setup.md for details."
+            ) from exc
         if REPORT_FOLDER_ID:
             log.warning(
                 "Failed to create doc in folder %s (%s). "
@@ -82,10 +97,19 @@ def _get_or_create_doc(docs_service, drive_service, run_date: str) -> str:
                 REPORT_FOLDER_ID, exc,
             )
             file_metadata.pop("parents", None)
-            file = drive_service.files().create(
-                body=file_metadata,
-                fields="id",
-            ).execute()
+            try:
+                file = drive_service.files().create(
+                    body=file_metadata,
+                    fields="id",
+                ).execute()
+            except HttpError as inner_exc:
+                if inner_exc.resp.status == 403 and "storageQuotaExceeded" in str(inner_exc):
+                    raise RuntimeError(
+                        "Google Drive storage quota exceeded for the service account. "
+                        "Free up space or use a different account. "
+                        "See docs/setup.md for details."
+                    ) from inner_exc
+                raise
         else:
             raise
     doc_id: str = file["id"]
