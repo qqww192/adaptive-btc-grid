@@ -6,6 +6,7 @@ Test Case 1 (Daily):  Gemini news scan → Telegram alert
 Test Case 2 (Weekly): T212 fetch → Gemini analysis → Google Drive report → Telegram snapshot
 """
 
+import base64
 import os
 import sys
 import json
@@ -31,7 +32,8 @@ def test_t212_connection() -> bool:
         log.error("  FAIL — T212_API_KEY or T212_SECRET_KEY not set.")
         return False
 
-    headers = {"Authorization": api_key, "X-Secret-Key": secret_key}
+    credentials = base64.b64encode(f"{api_key}:{secret_key}".encode()).decode()
+    headers = {"Authorization": f"Basic {credentials}"}
     try:
         resp = httpx.get(f"{T212_BASE}/equity/portfolio", headers=headers, timeout=TIMEOUT)
         resp.raise_for_status()
