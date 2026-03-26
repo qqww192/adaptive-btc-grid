@@ -14,7 +14,7 @@ import sys
 import logging
 from dotenv import load_dotenv
 
-from fetch_portfolio import fetch_all_positions
+from fetch_portfolio import fetch_all_positions, t212_to_yfinance
 from sheets import SheetManager
 from market_data import (
     get_batch_prices,
@@ -137,9 +137,16 @@ def main() -> None:
         log.warning("No positions returned. Continuing with existing sheet data.")
     else:
         log.info("  %d positions fetched. Getting live prices...", len(positions))
-        symbols = [p.get("ticker", "") for p in positions if p.get("ticker")]
-        live_prices = get_batch_prices(symbols)
-        log.info("  Live prices fetched for %d symbols.", len(live_prices))
+        # Map T212 tickers to yfinance format for price lookup
+        t212_tickers = [p["ticker"] for p in positions if p.get("ticker")]
+        yf_tickers = [t212_to_yfinance(t) for t in t212_tickers]
+        yf_prices = get_batch_prices(yf_tickers)
+        # Map prices back to T212 ticker keys
+        live_prices = {}
+        for t212_t, yf_t in zip(t212_tickers, yf_tickers):
+            if yf_t in yf_prices and yf_prices[yf_t]:
+                live_prices[t212_t] = yf_prices[yf_t]
+        log.info("  Live prices fetched for %d/%d symbols.", len(live_prices), len(t212_tickers))
         sheet.sync_portfolio(positions, prices=live_prices)
 
     # ── Step 4: AI analysis (structured) ───────────────────────────────────
@@ -164,11 +171,12 @@ def main() -> None:
                 log.info("  Budget exhausted after %d stocks.", analysed)
                 break
             symbol = stock["symbol"]
-            log.info("  Analysing %s (weight %s%%)...", symbol, stock.get("weight", "0"))
+            yf_symbol = t212_to_yfinance(symbol)
+            log.info("  Analysing %s → %s (weight %s%%)...", symbol, yf_symbol, stock.get("weight", "0"))
             if not budget.consume():
                 break
             try:
-                context = build_stock_context(symbol)
+                context = build_stock_context(yf_symbol)
                 result = analyse_stock(
                     gemini,
                     symbol=symbol,

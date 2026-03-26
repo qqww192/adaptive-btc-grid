@@ -103,26 +103,33 @@ def main() -> None:
 
     # ── Step 5: Fetch T212 portfolio ─────────────────────────────────────
     log.info("Fetching T212 portfolio...")
-    from fetch_portfolio import fetch_all_positions
+    from fetch_portfolio import fetch_all_positions, t212_to_yfinance
     positions = fetch_all_positions()
     if not positions:
         log.warning("No positions returned.")
     else:
         log.info("%d positions fetched.", len(positions))
         for p in positions[:10]:
-            log.info("  %-10s qty=%.2f  avgPrice=%.2f  price=%.2f  P/L=%.2f",
-                     p.get("ticker", "?"), p.get("quantity", 0),
-                     p.get("averagePrice", 0), p.get("currentPrice", 0),
-                     p.get("ppl", 0))
+            log.info("  %-10s qty=%.4f  avgPrice=%.2f  price=%.2f  P/L=%.2f",
+                     p["ticker"], p["quantity"],
+                     p["averagePrice"], p["currentPrice"],
+                     p["ppl"])
         if len(positions) > 10:
             log.info("  ... and %d more", len(positions) - 10)
 
-        # Get live prices from yfinance
+        # Get live prices from yfinance (map T212 tickers to yfinance format)
         log.info("Fetching live prices from yfinance...")
         from market_data import get_batch_prices
-        symbols = [p.get("ticker", "") for p in positions if p.get("ticker")]
-        live_prices = get_batch_prices(symbols)
-        log.info("Live prices fetched for %d symbols.", len(live_prices))
+        t212_tickers = [p["ticker"] for p in positions if p.get("ticker")]
+        yf_tickers = [t212_to_yfinance(t) for t in t212_tickers]
+        log.info("  T212 tickers: %s", t212_tickers[:5])
+        log.info("  yfinance tickers: %s", yf_tickers[:5])
+        yf_prices = get_batch_prices(yf_tickers)
+        live_prices = {}
+        for t212_t, yf_t in zip(t212_tickers, yf_tickers):
+            if yf_t in yf_prices and yf_prices[yf_t]:
+                live_prices[t212_t] = yf_prices[yf_t]
+        log.info("Live prices fetched for %d/%d symbols.", len(live_prices), len(t212_tickers))
 
         # Sync to Portfolio tab
         log.info("Syncing to Portfolio tab...")
