@@ -19,6 +19,7 @@ from sheets import SheetManager
 from market_data import (
     get_batch_prices,
     get_market_scorecard,
+    get_signal_metrics,
     build_stock_context,
     build_market_summary,
     evaluate_alert,
@@ -71,6 +72,17 @@ def main() -> None:
         log.error("  Market scorecard failed: %s", e)
         scorecard = []
         market_summary = ""
+
+    # ── Step 2b: Signal metrics (yfinance computed, no Gemini) ──────────
+    log.info("Step 2b — Computing signal metrics...")
+    try:
+        signals = get_signal_metrics()
+        sheet.write_signals(signals)
+        log.info("  %d signals computed.", len(signals))
+        for s in signals:
+            log.info("    %-25s %10s  [%s]", s["name"], s["value"], s["signal"])
+    except Exception as e:
+        log.error("  Signal metrics failed: %s", e)
 
     # ── Step 3: AI market interpretation (1 Gemini request) ──────────────
     if not budget.exhausted and market_summary:

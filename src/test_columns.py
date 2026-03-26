@@ -28,8 +28,8 @@ def main() -> None:
     # ── Step 1: Connect & verify tabs ────────────────────────────────────
     log.info("\nSTEP 1: Connecting to Google Sheet...")
     try:
-        from sheets import SheetManager, TAB_PORTFOLIO, TAB_MARKET, TAB_ALERTS
-        from sheets import PORTFOLIO_HEADERS, MARKET_HEADERS, ALERT_HEADERS
+        from sheets import SheetManager, TAB_PORTFOLIO, TAB_MARKET, TAB_SIGNALS, TAB_ALERTS
+        from sheets import PORTFOLIO_HEADERS, MARKET_HEADERS, SIGNAL_HEADERS, ALERT_HEADERS
         sheet = SheetManager()
         log.info("  Connected: %s", sheet.url)
     except Exception as e:
@@ -41,6 +41,7 @@ def main() -> None:
     for tab, headers in [
         (TAB_PORTFOLIO, PORTFOLIO_HEADERS),
         (TAB_MARKET, MARKET_HEADERS),
+        (TAB_SIGNALS, SIGNAL_HEADERS),
         (TAB_ALERTS, ALERT_HEADERS),
     ]:
         try:
@@ -97,8 +98,24 @@ def main() -> None:
     except Exception as e:
         log.error("  Failed: %s", e)
 
-    # ── Step 5: Test alert evaluation ────────────────────────────────────
-    log.info("\nSTEP 5: Testing alert evaluation...")
+    # ── Step 5: Signal metrics ─────────────────────────────────────────
+    log.info("\nSTEP 5: Computing high-reliability signal metrics...")
+    try:
+        from market_data import get_signal_metrics
+
+        signals = get_signal_metrics()
+        log.info("  %d signals computed:", len(signals))
+        for s in signals:
+            log.info("    %-25s %10s  %-20s [%s] (%s)",
+                     s["name"], s["value"], s["reading"], s["signal"], s["success_rate"])
+
+        sheet.write_signals(signals)
+        log.info("  Signals written to sheet.")
+    except Exception as e:
+        log.error("  Signal metrics failed: %s", e)
+
+    # ── Step 6: Test alert evaluation ────────────────────────────────────
+    log.info("\nSTEP 6: Testing alert evaluation...")
     try:
         from market_data import evaluate_alert
 
@@ -132,6 +149,7 @@ def main() -> None:
     log.info("Tab structure:")
     log.info("  Portfolio:       %s", PORTFOLIO_HEADERS)
     log.info("  Market Overview: %s", MARKET_HEADERS)
+    log.info("  Signals:         %s", SIGNAL_HEADERS)
     log.info("  Alerts:          %s", ALERT_HEADERS)
     log.info("")
     log.info("Alert examples (fill in Alerts tab):")

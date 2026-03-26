@@ -2,9 +2,10 @@
 sheets.py
 Google Sheets integration for the T212 Portfolio Checker.
 
-Three tabs:
+Four tabs:
   - Portfolio:       Pie | Symbol | Amount | Price | Weight % | Verdict | Fair Value | Risk | Key Note | Updated
   - Market Overview: Date | Category | Indicator | Value | Change % | Signal | Updated
+  - Signals:         Date | Indicator | Value | Reading | Signal | Success Rate | Timeframe | Updated
   - Alerts:          Symbol | Metric | Condition | Threshold | Current | Status | Last Checked
                      (user fills first 4 columns, system fills last 3)
 
@@ -33,6 +34,7 @@ SHEET_ID: str = os.environ.get("GOOGLE_SHEET_ID", "")
 # Tab names
 TAB_PORTFOLIO = "Portfolio"
 TAB_MARKET = "Market Overview"
+TAB_SIGNALS = "Signals"
 TAB_ALERTS = "Alerts"
 
 # Column headers
@@ -43,6 +45,11 @@ PORTFOLIO_HEADERS = [
 
 MARKET_HEADERS = [
     "Date", "Category", "Indicator", "Value", "Change %", "Signal", "Updated",
+]
+
+SIGNAL_HEADERS = [
+    "Date", "Indicator", "Value", "Reading", "Signal",
+    "Success Rate", "Timeframe", "Updated",
 ]
 
 ALERT_HEADERS = [
@@ -67,7 +74,7 @@ def _ensure_tabs_exist(sheets_service, sheet_id: str) -> None:
     spreadsheet = sheets_service.spreadsheets().get(spreadsheetId=sheet_id).execute()
     existing_tabs = {s["properties"]["title"] for s in spreadsheet["sheets"]}
 
-    required_tabs = [TAB_PORTFOLIO, TAB_MARKET, TAB_ALERTS]
+    required_tabs = [TAB_PORTFOLIO, TAB_MARKET, TAB_SIGNALS, TAB_ALERTS]
     missing = [t for t in required_tabs if t not in existing_tabs]
     if not missing:
         return
@@ -80,6 +87,7 @@ def _ensure_tabs_exist(sheets_service, sheet_id: str) -> None:
     headers_map = {
         TAB_PORTFOLIO: PORTFOLIO_HEADERS,
         TAB_MARKET: MARKET_HEADERS,
+        TAB_SIGNALS: SIGNAL_HEADERS,
         TAB_ALERTS: ALERT_HEADERS,
     }
     header_data = [
@@ -242,6 +250,37 @@ class SheetManager:
             valueInputOption="RAW",
             body={"values": [row]},
         ).execute()
+
+    # ── Signals tab ─────────────────────────────────────────────────────────────
+    # Columns: Date | Indicator | Value | Reading | Signal | Success Rate | Timeframe | Updated
+
+    def write_signals(self, signals: list[dict]) -> None:
+        """
+        Write high-reliability signal metrics.
+        Each entry: {name, value, reading, signal, success_rate, timeframe}
+        """
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        existing = self._read_tab(TAB_SIGNALS)
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+        kept = [r for r in existing if not (len(r) >= 1 and r[0] == today)]
+
+        new_rows = []
+        for s in signals:
+            new_rows.append([
+                today,
+                s.get("name", ""),
+                s.get("value", ""),
+                s.get("reading", ""),
+                s.get("signal", ""),
+                s.get("success_rate", ""),
+                s.get("timeframe", ""),
+                now,
+            ])
+
+        all_rows = [SIGNAL_HEADERS] + kept + new_rows
+        self._write_tab(TAB_SIGNALS, all_rows)
+        log.info("Signals tab updated with %d indicators.", len(new_rows))
 
     # ── Alerts tab ─────────────────────────────────────────────────────────────
     # Columns: Symbol | Metric | Condition | Threshold | Current | Status | Last Checked
