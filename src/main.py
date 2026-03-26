@@ -1,31 +1,36 @@
 """
 T212 Portfolio Checker — Daily Orchestrator
 
-Daily workflow (budget: 19 Gemini requests):
-  1. Fetch portfolio from T212 and sync to Google Sheet
-  2. Analyse watchlist symbols (if any filled by user)
-  3. Basic market overview (1 request)
-  4. Advanced individual stock analysis (remaining budget, by priority)
-  5. Stop at 19 requests, update sheet, wait for next day
+Daily workflow:
+  1. Fetch portfolio from T212, get live prices via yfinance, sync to sheet
+  2. Fetch full market scorecard (VIX, yields, DXY, gold, oil, indices) + health score
+  3. AI market interpretation (1 Gemini request)
+  4. AI stock analysis — structured: verdict, fair value, risk, key note (by weight)
+  5. Evaluate user-defined alerts (no Gemini needed)
 """
 
 import os
 import sys
 import logging
-from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 from fetch_portfolio import fetch_all_positions
 from sheets import SheetManager
+from market_data import (
+    get_batch_prices,
+    get_market_scorecard,
+    get_signal_metrics,
+    build_stock_context,
+    build_market_summary,
+    evaluate_alert,
+)
 from analyse import (
     _get_client,
     AnalysisBudget,
-    analyse_watchlist_symbol,
     analyse_market_overview,
-    analyse_stock_advanced,
+    analyse_stock,
 )
 
-# ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -37,96 +42,133 @@ log = logging.getLogger(__name__)
 def main() -> None:
     load_dotenv()
 
-    log.info("=== T212 Portfolio Checker starting (daily run) ===")
-    run_date = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    log.info("=== T212 Portfolio Checker starting ===")
 
-    # ── Initialise services ────────────────────────────────────────────────
     gemini = _get_client()
     budget = AnalysisBudget()
     sheet = SheetManager()
     log.info("Sheet URL: %s", sheet.url)
 
-    # ── Step 1: Fetch & sync portfolio ─────────────────────────────────────
+    # ── Step 1: Fetch & sync portfolio ───────────────────────────────────
     log.info("Step 1 — Fetching portfolio from Trading 212...")
     positions = fetch_all_positions()
     if not positions:
         log.warning("No positions returned. Continuing with existing sheet data.")
     else:
-        log.info("  %d positions fetched. Syncing to sheet...", len(positions))
-        sheet.sync_portfolio(positions)
+        log.info("  %d positions fetched. Getting live prices...", len(positions))
+        symbols = [p.get("ticker", "") for p in positions if p.get("ticker")]
+        live_prices = get_batch_prices(symbols)
+        log.info("  Live prices fetched for %d symbols.", len(live_prices))
+        sheet.sync_portfolio(positions, prices=live_prices)
 
-    # ── Step 2: Analyse watchlist symbols ───────────────────────────────────
-    log.info("Step 2 — Checking watchlist for symbols to analyse...")
-    watchlist = sheet.get_watchlist()
-    if watchlist:
-        log.info("  %d watchlist symbols found.", len(watchlist))
-        for item in watchlist:
-            if budget.exhausted:
-                log.info("  Budget exhausted. Remaining watchlist deferred to tomorrow.")
-                break
-            symbol = item["symbol"]
-            log.info("  Analysing watchlist symbol: %s", symbol)
-            if not budget.consume():
-                break
-            try:
-                analysis = analyse_watchlist_symbol(gemini, symbol, item.get("market", ""))
-                sheet.update_watchlist_analysis(symbol, analysis)
-                log.info("  %s analysis written to sheet.", symbol)
-            except Exception as e:
-                log.error("  Failed to analyse %s: %s", symbol, e)
-    else:
-        log.info("  No watchlist symbols to analyse.")
+    # ── Step 2: Market scorecard (all yfinance, no Gemini) ───────────────
+    log.info("Step 2 — Building market scorecard...")
+    try:
+        scorecard = get_market_scorecard()
+        sheet.write_market_overview(scorecard)
+        market_summary = build_market_summary(scorecard)
+        log.info("  Market scorecard written (%d indicators).", len(scorecard))
+    except Exception as e:
+        log.error("  Market scorecard failed: %s", e)
+        scorecard = []
+        market_summary = ""
 
-    # ── Step 3: Basic market overview ──────────────────────────────────────
-    if not budget.exhausted:
-        log.info("Step 3 — Running basic market overview...")
-        if not budget.consume():
-            log.info("  Budget exhausted. Market overview deferred.")
-        else:
+    # ── Step 2b: Signal metrics (yfinance computed, no Gemini) ──────────
+    log.info("Step 2b — Computing signal metrics...")
+    try:
+        signals = get_signal_metrics()
+        sheet.write_signals(signals)
+        log.info("  %d signals computed.", len(signals))
+        for s in signals:
+            log.info("    %-25s %10s  [%s]", s["name"], s["value"], s["signal"])
+    except Exception as e:
+        log.error("  Signal metrics failed: %s", e)
+
+    # ── Step 3: AI market interpretation (1 Gemini request) ──────────────
+    if not budget.exhausted and market_summary:
+        log.info("Step 3 — AI market interpretation...")
+        if budget.consume():
             try:
                 market_positions = positions or []
-                entries = analyse_market_overview(gemini, market_positions)
-                sheet.write_market_overview(entries)
-                log.info("  Market overview written to sheet.")
+                ai_summary = analyse_market_overview(gemini, market_summary, market_positions)
+                # Append AI summary as the last row in market overview
+                sheet.write_market_ai_summary(ai_summary)
+                log.info("  AI summary: %s", ai_summary[:100])
             except Exception as e:
-                log.error("  Market overview failed: %s", e)
+                log.error("  Market AI interpretation failed: %s", e)
     else:
-        log.info("Step 3 — Skipped (budget exhausted).")
+        log.info("Step 3 — Skipped.")
 
-    # ── Step 4: Advanced individual stock analysis ─────────────────────────
+    # ── Step 4: Stock analysis (structured) ──────────────────────────────
     if not budget.exhausted:
-        log.info("Step 4 — Running advanced stock analysis (budget: %d remaining)...", budget.remaining)
+        log.info("Step 4 — Analysing stocks (budget: %d remaining)...", budget.remaining)
         stocks = sheet.get_portfolio_for_analysis()
         analysed = 0
         for stock in stocks:
             if budget.exhausted:
-                log.info("  Budget exhausted after %d stocks. Rest deferred to tomorrow.", analysed)
+                log.info("  Budget exhausted after %d stocks.", analysed)
                 break
             symbol = stock["symbol"]
-            log.info("  Analysing %s (priority %d)...", symbol, stock["priority"])
+            log.info("  Analysing %s (weight %s%%)...", symbol, stock.get("weight", "0"))
             if not budget.consume():
                 break
             try:
-                analysis = analyse_stock_advanced(
+                context = build_stock_context(symbol)
+                result = analyse_stock(
                     gemini,
                     symbol=symbol,
-                    market=stock.get("market", ""),
-                    quantity=stock.get("quantity", 0),
-                    avg_price=stock.get("avg_price", 0),
-                    current_price=stock.get("current_price", 0),
-                    ppl=stock.get("ppl", 0),
+                    financial_context=context,
+                    amount=stock.get("amount", 0),
+                    price=stock.get("price", 0),
+                    weight=stock.get("weight", "0"),
+                    market_context=market_summary,
                 )
-                sheet.update_portfolio_analysis(symbol, analysis)
-                log.info("  %s analysis written to sheet.", symbol)
+                sheet.update_portfolio_analysis(
+                    symbol,
+                    verdict=result["verdict"],
+                    fair_value=result["fair_value"],
+                    risk=result["risk"],
+                    key_note=result["key_note"],
+                )
+                log.info("  %s → %s (fair: $%s, risk: %s/10)",
+                         symbol, result["verdict"], result["fair_value"], result["risk"])
                 analysed += 1
             except Exception as e:
                 log.error("  Failed to analyse %s: %s", symbol, e)
     else:
         log.info("Step 4 — Skipped (budget exhausted).")
 
-    # ── Summary ────────────────────────────────────────────────────────────
+    # ── Step 5: Evaluate alerts (yfinance only, no Gemini) ───────────────
+    log.info("Step 5 — Evaluating alerts...")
+    alerts = sheet.get_alerts()
+    if alerts:
+        for alert in alerts:
+            try:
+                current = evaluate_alert(alert["symbol"], alert["metric"])
+                threshold = float(alert["threshold"])
+                condition = alert["condition"].strip().lower()
+
+                if condition in ("above", ">", ">="):
+                    triggered = current >= threshold
+                elif condition in ("below", "<", "<="):
+                    triggered = current <= threshold
+                else:
+                    log.warning("  Unknown condition '%s' for %s", condition, alert["symbol"])
+                    continue
+
+                sheet.update_alert_status(alert["row_index"], current, triggered)
+                status = "TRIGGERED" if triggered else "OK"
+                log.info("  %s %s %s %s → %s (current: %.2f)",
+                         alert["symbol"], alert["metric"], condition, alert["threshold"],
+                         status, current)
+            except Exception as e:
+                log.error("  Alert check failed for %s: %s", alert["symbol"], e)
+    else:
+        log.info("  No alerts configured. Add rules in the Alerts tab.")
+
+    # ── Summary ──────────────────────────────────────────────────────────
     log.info(
-        "=== Pipeline complete — %d/%d Gemini requests used ===",
+        "=== Done — %d/%d Gemini requests used ===",
         budget.used, budget.max_requests,
     )
     log.info("Sheet: %s", sheet.url)

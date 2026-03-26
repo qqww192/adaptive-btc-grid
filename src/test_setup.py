@@ -1,6 +1,6 @@
 """
 test_setup.py
-Interactive setup script to test Sheet creation and T212 portfolio sync.
+Interactive setup script to test Sheet access and T212 portfolio sync.
 Skips Gemini analysis — just validates Google Sheets + T212 connections.
 
 Usage:
@@ -11,8 +11,7 @@ Required .env variables:
   T212_API_KEY=...
   T212_SECRET_KEY=...
   GOOGLE_SA_JSON={"type":"service_account",...}
-  GOOGLE_DRIVE_FOLDER_ID=...   (optional — folder to create sheet in)
-  GOOGLE_SHEET_ID=             (leave blank — will be created)
+  GOOGLE_SHEET_ID=...          (ID of existing spreadsheet shared with SA)
 """
 
 import sys
@@ -34,22 +33,66 @@ def main() -> None:
     log.info("T212 Portfolio Checker — Setup Test")
     log.info("=" * 60)
 
-    # ── Step 1: Test Google Sheets connection & create sheet ───────────────
+    # ── Step 0: Diagnose service account ────────────────────────────────────
+    import os, json
+    sa_json = os.environ.get("GOOGLE_SA_JSON", "")
+    if sa_json:
+        try:
+            sa = json.loads(sa_json)
+            log.info("Service account email : %s", sa.get("client_email", "MISSING"))
+            log.info("Project ID            : %s", sa.get("project_id", "MISSING"))
+        except json.JSONDecodeError:
+            log.error("GOOGLE_SA_JSON is not valid JSON!")
+    else:
+        log.error("GOOGLE_SA_JSON is empty!")
+
+    log.info("GOOGLE_SHEET_ID       : %s", os.environ.get("GOOGLE_SHEET_ID", "(not set)"))
+
+    # ── Step 0.5: Test raw Google API auth ───────────────────────────────
     log.info("")
-    log.info("STEP 1: Creating Google Sheet...")
+    log.info("STEP 0.5: Testing Google API authentication...")
+    log.info("-" * 40)
+    try:
+        from google.oauth2 import service_account as _sa
+        from googleapiclient.discovery import build as _build
+
+        _creds = _sa.Credentials.from_service_account_info(
+            json.loads(sa_json),
+            scopes=["https://www.googleapis.com/auth/spreadsheets"],
+        )
+        log.info("  Credentials created OK for: %s", _creds.service_account_email)
+
+        sheet_id = os.environ.get("GOOGLE_SHEET_ID", "")
+        if not sheet_id:
+            log.error("  GOOGLE_SHEET_ID not set. Set it to an existing spreadsheet ID.")
+            sys.exit(1)
+
+        _sheets = _build("sheets", "v4", credentials=_creds)
+        ss = _sheets.spreadsheets().get(spreadsheetId=sheet_id).execute()
+        log.info("  Sheets API: OK — can read '%s'", ss.get("properties", {}).get("title", "Untitled"))
+
+    except Exception as e:
+        log.error("AUTH TEST FAILED: %s", e)
+        log.error("")
+        log.error("Troubleshooting checklist:")
+        log.error("  1. Is the Google Sheets API enabled for project '%s'?", sa.get("project_id", "?"))
+        log.error("     → https://console.cloud.google.com/apis/library/sheets.googleapis.com")
+        log.error("  2. Is the spreadsheet shared with the service account email as Editor?")
+        log.error("  3. Was GOOGLE_SA_JSON pasted correctly? (multiline JSON can break in GitHub Secrets)")
+        sys.exit(1)
+
+    # ── Step 1: Test Google Sheets connection ──────────────────────────────
+    log.info("")
+    log.info("STEP 1: Connecting to Google Sheet...")
     log.info("-" * 40)
     try:
         from sheets import SheetManager
         sheet = SheetManager()
-        log.info("SUCCESS — Sheet created/found!")
+        log.info("SUCCESS — Sheet connected!")
         log.info("  Sheet URL: %s", sheet.url)
-        log.info("")
-        log.info("  >>> Save this Sheet ID to your GitHub Secrets as GOOGLE_SHEET_ID:")
-        log.info("  >>> %s", sheet.sheet_id)
-        log.info("")
     except Exception as e:
-        log.error("FAILED — Could not create/access Google Sheet: %s", e)
-        log.error("Check your GOOGLE_SA_JSON and GOOGLE_DRIVE_FOLDER_ID env vars.")
+        log.error("FAILED — Could not access Google Sheet: %s", e)
+        log.error("Check your GOOGLE_SA_JSON and GOOGLE_SHEET_ID env vars.")
         sys.exit(1)
 
     # ── Step 2: Fetch T212 portfolio and sync to sheet ─────────────────────

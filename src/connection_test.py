@@ -120,42 +120,59 @@ def test_gemini_portfolio_analysis() -> bool:
         return False
 
 
-def test_google_drive_connection() -> bool:
-    """Test Google Drive/Docs API connectivity."""
+def test_google_sheets_connection() -> bool:
+    """Test Google Sheets API connectivity by reading the existing spreadsheet."""
     sa_json = os.environ.get("GOOGLE_SA_JSON", "")
     if not sa_json:
         log.error("  FAIL — GOOGLE_SA_JSON not set.")
         return False
 
+    sheet_id = os.environ.get("GOOGLE_SHEET_ID", "")
+    if not sheet_id:
+        log.error("  FAIL — GOOGLE_SHEET_ID not set. Set it to an existing spreadsheet ID.")
+        return False
+
     try:
         from google.oauth2 import service_account
         from googleapiclient.discovery import build
+        from googleapiclient.errors import HttpError
 
         sa_dict = json.loads(sa_json)
-        scopes = [
-            "https://www.googleapis.com/auth/drive",
-            "https://www.googleapis.com/auth/documents",
-        ]
+        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
         creds = service_account.Credentials.from_service_account_info(sa_dict, scopes=scopes)
-        drive_service = build("drive", "v3", credentials=creds)
 
-        # Simple test: list files (limit 1) to verify auth works
-        results = drive_service.files().list(pageSize=1, fields="files(id, name)").execute()
-        files = results.get("files", [])
-        log.info(f"  PASS — Google Drive connected. {len(files)} file(s) visible to service account.")
+        sheets_service = build("sheets", "v4", credentials=creds)
 
-        # If GOOGLE_DOC_ID is set, verify access to the master doc
-        doc_id = os.environ.get("GOOGLE_DOC_ID", "")
-        if doc_id:
-            docs_service = build("docs", "v1", credentials=creds)
-            doc = docs_service.documents().get(documentId=doc_id).execute()
-            log.info(f"  PASS — Master Google Doc accessible: '{doc.get('title', 'Untitled')}'")
-        else:
-            log.info("  SKIP — GOOGLE_DOC_ID not set (will be created on first run).")
+        # --- Step A: Read the spreadsheet metadata ---
+        spreadsheet = sheets_service.spreadsheets().get(spreadsheetId=sheet_id).execute()
+        title = spreadsheet.get("properties", {}).get("title", "Untitled")
+        tabs = [s["properties"]["title"] for s in spreadsheet.get("sheets", [])]
+        log.info(f"  PASS — Sheets API read: '{title}' with tabs: {tabs}")
 
+        # --- Step B: Test write by updating a cell and clearing it ---
+        test_range = f"'{tabs[0]}'!ZZ1"
+        sheets_service.spreadsheets().values().update(
+            spreadsheetId=sheet_id,
+            range=test_range,
+            valueInputOption="RAW",
+            body={"values": [["__test__"]]},
+        ).execute()
+        sheets_service.spreadsheets().values().clear(
+            spreadsheetId=sheet_id,
+            range=test_range,
+        ).execute()
+        log.info("  PASS — Sheets API write: read/write access confirmed.")
+
+        log.info("  PASS — Google Sheets connection verified.")
         return True
+    except HttpError as e:
+        log.error(f"  FAIL — Google Sheets API error: {e}")
+        if "PERMISSION_DENIED" in str(e):
+            log.error("         The spreadsheet is not shared with the service account.")
+            log.error("         Share it with the SA email as Editor.")
+        return False
     except Exception as e:
-        log.error(f"  FAIL — Google Drive error: {e}")
+        log.error(f"  FAIL — Google API error: {e}")
         return False
 
 
@@ -260,8 +277,8 @@ def run_test_case_2() -> dict[str, bool]:
     log.info("  Step 2/4: Gemini portfolio analysis...")
     results["2.2 Gemini analysis"] = test_gemini_portfolio_analysis()
 
-    log.info("  Step 3/4: Google Drive / Docs connection...")
-    results["2.3 Google Drive"] = test_google_drive_connection()
+    log.info("  Step 3/4: Google Sheets connection...")
+    results["2.3 Google Sheets"] = test_google_sheets_connection()
 
     log.info("  Step 4/4: Telegram snapshot delivery...")
     results["2.4 Telegram delivery"] = test_telegram_connection()

@@ -1,15 +1,12 @@
 """
 analyse.py
-Three-tier Gemini analysis engine with request budget management.
+Gemini analysis engine — returns structured data, not markdown blobs.
 
-Tiers (run in order, budget = 19 requests/day):
-  1. Watchlist  — analyse user-added symbols (1 request each)
-  2. Basic      — market overview by region/sector weighted by portfolio (1 request)
-  3. Advanced   — deep individual stock research, prioritised by sheet (1 request each)
-
-Uses the google-genai SDK. Each call counts against the daily budget.
+Each stock analysis returns: verdict, fair_value, risk, key_note
+Market overview returns: a short summary sentence for the sheet.
 """
 
+import json
 import os
 import re
 import logging
@@ -36,7 +33,7 @@ def _get_client() -> genai.Client:
 
 
 def _call_gemini(client: genai.Client, prompt: str) -> str:
-    """Call Gemini with retry on 429. Returns the response text."""
+    """Call Gemini with retry on 429."""
     max_retries = 3
     for attempt in range(1, max_retries + 1):
         try:
@@ -48,235 +45,114 @@ def _call_gemini(client: genai.Client, prompt: str) -> str:
                 match = re.search(r"retry in ([\d.]+)s", str(exc), re.IGNORECASE)
                 if match:
                     wait = float(match.group(1)) + 2
-                log.warning(
-                    "Gemini rate-limited (attempt %d/%d). Waiting %.0fs.",
-                    attempt, max_retries, wait,
-                )
+                log.warning("Rate-limited (attempt %d/%d). Waiting %.0fs.", attempt, max_retries, wait)
                 time.sleep(wait)
             else:
                 raise
 
     text = response.text
     if not text:
-        log.error("Gemini returned no text. Full response: %s", response)
         raise RuntimeError("Gemini returned an empty response.")
     return text
 
 
-# ── Tier 1: Watchlist Analysis ─────────────────────────────────────────────
+def _parse_json_response(text: str) -> dict:
+    """Extract JSON from Gemini response (handles markdown code blocks)."""
+    # Try to find JSON in code block
+    json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if json_match:
+        return json.loads(json_match.group(1))
+    # Try raw JSON
+    brace_start = text.find("{")
+    brace_end = text.rfind("}") + 1
+    if brace_start >= 0 and brace_end > brace_start:
+        return json.loads(text[brace_start:brace_end])
+    raise ValueError(f"No JSON found in response: {text[:200]}")
 
 
-def analyse_watchlist_symbol(client: genai.Client, symbol: str, market: str) -> str:
+# ── Stock Analysis (structured) ──────────────────────────────────────────────
+
+
+def analyse_stock(
+    client: genai.Client,
+    symbol: str,
+    financial_context: str,
+    amount: Any,
+    price: Any,
+    weight: Any,
+    market_context: str = "",
+) -> dict:
     """
-    Deep research on a watchlist symbol using multi-layered analysis.
-    Inspired by quantitative research methodology:
-    1. Fundamental snapshot
-    2. Technical momentum
-    3. Catalyst / news scan
-    4. Risk assessment
-    5. Valuation verdict
+    Analyse a stock and return structured data.
+    Returns: {verdict, fair_value, risk, key_note}
     """
-    prompt = f"""You are an expert equity research analyst. Perform a comprehensive
-analysis of {symbol} ({market} market).
+    prompt = f"""You are a senior equity analyst. Analyse {symbol} and return ONLY a JSON object.
 
-Structure your analysis as follows:
+Live data: {financial_context}
+Position: {amount} shares at ${price}, weight: {weight}%
+Market context: {market_context}
 
-## 1. Company & Fundamental Snapshot
-- Business model, revenue drivers, competitive moat
-- Latest earnings highlights (EPS, revenue growth, margins)
-- Balance sheet health (debt/equity, cash position)
+Criteria to evaluate:
+- P/E vs industry average (undervalued if below)
+- Revenue growth consistency
+- Profit margin trend
+- Debt-to-equity vs peers
+- Sentiment vs fundamentals gap (is market mispricing it?)
+- Free cash flow strength
 
-## 2. Technical & Momentum Analysis
-- Current price trend (bullish/bearish/neutral)
-- Key support and resistance levels
-- Volume trends and any notable patterns
+Return ONLY this JSON (no other text):
+{{
+  "verdict": "STRONG BUY" or "BUY" or "HOLD" or "SELL" or "STRONG SELL",
+  "fair_value": estimated fair value as a number (e.g. 185.50),
+  "risk": risk score 1-10 (1=very safe, 10=very risky),
+  "key_note": "One sentence: why this verdict, mention the key number that matters most"
+}}"""
 
-## 3. Catalyst & News Scan
-- Recent material news, earnings surprises, or guidance changes
-- Upcoming catalysts (earnings dates, product launches, regulatory)
-- Sector/industry tailwinds or headwinds
-
-## 4. Risk Assessment
-- Top 3 risks specific to this stock
-- Macro risks (interest rates, geopolitical, currency)
-- Risk rating: 1 (very low) to 10 (very high)
-
-## 5. Valuation Verdict
-- Fair value estimate vs current price
-- Bull case / Base case / Bear case price targets
-- Overall rating: STRONG BUY / BUY / HOLD / SELL / STRONG SELL
-
-Be concise but thorough. Use specific numbers where possible.
-Format as clean markdown.
-"""
-    return _call_gemini(client, prompt)
+    text = _call_gemini(client, prompt)
+    try:
+        result = _parse_json_response(text)
+        return {
+            "verdict": str(result.get("verdict", "HOLD")),
+            "fair_value": str(result.get("fair_value", "")),
+            "risk": str(result.get("risk", "5")),
+            "key_note": str(result.get("key_note", "")),
+        }
+    except (json.JSONDecodeError, ValueError) as e:
+        log.warning("Failed to parse JSON for %s, using fallback: %s", symbol, e)
+        return {
+            "verdict": "HOLD",
+            "fair_value": "",
+            "risk": "5",
+            "key_note": text[:150].replace("\n", " "),
+        }
 
 
-# ── Tier 2: Basic Market Overview ──────────────────────────────────────────
+# ── Market Overview ──────────────────────────────────────────────────────────
 
 
 def analyse_market_overview(
     client: genai.Client,
+    market_summary: str,
     positions: list[dict[str, Any]],
-) -> list[dict]:
-    """
-    Analyse major market indices and sectors weighted by portfolio exposure.
-    Returns a list of {region, index_sector, weight, analysis} dicts.
-    """
-    # Build portfolio weight summary
-    regions: dict[str, float] = {}
-    sectors: dict[str, list[str]] = {}
-    for pos in positions:
-        ticker = pos.get("ticker", "N/A")
-        market = pos.get("market", _detect_market_from_ticker(ticker))
-        value = abs(float(pos.get("currentPrice", 0)) * float(pos.get("quantity", 0)))
-        regions[market] = regions.get(market, 0) + value
-
-    total = sum(regions.values()) or 1
-    weight_summary = "\n".join(
-        f"- {region}: {val / total * 100:.1f}% of portfolio"
-        for region, val in sorted(regions.items(), key=lambda x: -x[1])
-    )
-
-    ticker_list = ", ".join(
-        pos.get("ticker", "N/A") for pos in positions[:60]
-    )
-
-    prompt = f"""You are a macro strategist. Analyse the current market environment
-relevant to this portfolio:
-
-Portfolio regional weights:
-{weight_summary}
-
-Holdings: {ticker_list}
-
-Provide a concise daily market briefing covering:
-
-## US Market
-- S&P 500, NASDAQ, Dow Jones: current momentum (bullish/bearish/neutral)
-- Key sector performance (tech, healthcare, financials, energy, etc.)
-- Notable macro signals (Fed, yields, VIX, DXY)
-
-## UK Market
-- FTSE 100, FTSE 250: current momentum
-- Key sector performance
-- Notable macro signals (BoE, gilts, GBP)
-
-## Global Signals
-- Major international indices (DAX, Nikkei, Hang Seng)
-- Commodities (oil, gold, copper) trends
-- Risk-on vs risk-off sentiment
-
-## Portfolio Impact
-- Which of my holdings benefit from current conditions
-- Which face headwinds
-- Key events to watch this week
-
-Keep it actionable and concise. Use bullet points.
-Format each region as a separate section.
-"""
-    full_analysis = _call_gemini(client, prompt)
-
-    # Parse into structured entries for the sheet
-    entries = []
-    for region in ["US", "UK", "Global"]:
-        weight_pct = f"{regions.get(region, 0) / total * 100:.1f}%" if region in regions else "N/A"
-        entries.append({
-            "region": region,
-            "index_sector": f"{region} Market Overview",
-            "weight": weight_pct,
-            "analysis": full_analysis if region == "US" else "",  # Full analysis on first entry
-        })
-
-    # Put the full analysis only on the first entry to avoid duplication
-    entries[0]["analysis"] = full_analysis
-
-    return entries
-
-
-# ── Tier 3: Advanced Individual Stock Analysis ─────────────────────────────
-
-
-def analyse_stock_advanced(
-    client: genai.Client,
-    symbol: str,
-    market: str,
-    quantity: Any,
-    avg_price: Any,
-    current_price: Any,
-    ppl: Any,
 ) -> str:
     """
-    Deep research on a portfolio stock with position context.
-    Uses 8-layer research methodology:
-    1. Business quality & moat
-    2. Financial health deep-dive
-    3. Growth trajectory
-    4. Management & governance
-    5. Technical analysis
-    6. Sentiment & flow
-    7. Risk matrix
-    8. Position-specific advice
+    Brief market interpretation. Returns a single sentence for the sheet.
+    The actual data (VIX, yields, etc.) is already in the sheet from yfinance.
+    This just adds the AI interpretation.
     """
-    prompt = f"""You are a senior equity research analyst conducting a deep-dive on
-{symbol} ({market} market).
+    ticker_list = ", ".join(pos.get("ticker", "N/A") for pos in positions[:30])
 
-My position: {quantity} shares, avg price {avg_price}, current {current_price},
-P/L: {ppl}
+    prompt = f"""You are a macro strategist. Given this market data, write ONE sentence (max 30 words) summarising the overall market stance and what it means for a portfolio holding: {ticker_list}
 
-Conduct an 8-layer research analysis:
+Market data:
+{market_summary}
 
-## 1. Business Quality & Moat
-- Core business model and competitive advantages
-- Market position and barriers to entry
-- Moat durability rating (wide/narrow/none)
+Return ONLY the sentence, no quotes or extra text."""
 
-## 2. Financial Health
-- Revenue growth (YoY, QoQ trends)
-- Profit margins (gross, operating, net) and trends
-- Free cash flow generation and capital allocation
-- Debt levels and interest coverage
-
-## 3. Growth Trajectory
-- TAM (total addressable market) and penetration
-- Growth drivers for next 1-3 years
-- Consensus revenue/EPS growth estimates
-
-## 4. Management & Governance
-- Management track record and insider ownership
-- Capital allocation history (buybacks, dividends, M&A)
-- Any red flags or concerns
-
-## 5. Technical Analysis
-- Price trend and key levels (support/resistance)
-- Moving average signals (50/200 DMA)
-- RSI and momentum indicators
-
-## 6. Sentiment & Flow
-- Institutional ownership changes
-- Short interest and days to cover
-- Analyst consensus and recent rating changes
-
-## 7. Risk Matrix
-- Company-specific risks (top 3)
-- Sector risks
-- Macro risks
-- Overall risk score: 1-10
-
-## 8. Position Advice
-- Given my entry at {avg_price} and current P/L of {ppl}:
-  - Hold / Add / Trim / Exit recommendation
-  - Suggested stop-loss level
-  - Price targets (6-month, 12-month)
-
-Overall verdict: STRONG BUY / BUY / HOLD / SELL / STRONG SELL
-
-Be specific with numbers. Format as clean, concise markdown.
-"""
-    return _call_gemini(client, prompt)
+    return _call_gemini(client, prompt).strip().strip('"')
 
 
-# ── Budget-aware orchestrator ──────────────────────────────────────────────
+# ── Budget ────────────────────────────────────────────────────────────────────
 
 
 class AnalysisBudget:
@@ -291,7 +167,6 @@ class AnalysisBudget:
         return self.max_requests - self.used
 
     def consume(self) -> bool:
-        """Consume one request. Returns True if budget allows, False if exhausted."""
         if self.used >= self.max_requests:
             return False
         self.used += 1
@@ -301,9 +176,3 @@ class AnalysisBudget:
     @property
     def exhausted(self) -> bool:
         return self.used >= self.max_requests
-
-
-def _detect_market_from_ticker(ticker: str) -> str:
-    if ticker.endswith("_EQ") or ".L" in ticker or ticker.endswith("_LSE"):
-        return "UK"
-    return "US"
