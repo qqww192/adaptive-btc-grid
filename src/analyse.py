@@ -1,11 +1,12 @@
 """
 analyse.py
-Gemini analysis engine with request budget management.
+Gemini analysis engine — returns structured data, not markdown blobs.
 
-Uses yfinance data for real financial context.
-Produces concise, actionable analysis.
+Each stock analysis returns: verdict, fair_value, risk, key_note
+Market overview returns: a short summary sentence for the sheet.
 """
 
+import json
 import os
 import re
 import logging
@@ -32,7 +33,7 @@ def _get_client() -> genai.Client:
 
 
 def _call_gemini(client: genai.Client, prompt: str) -> str:
-    """Call Gemini with retry on 429. Returns the response text."""
+    """Call Gemini with retry on 429."""
     max_retries = 3
     for attempt in range(1, max_retries + 1):
         try:
@@ -44,112 +45,114 @@ def _call_gemini(client: genai.Client, prompt: str) -> str:
                 match = re.search(r"retry in ([\d.]+)s", str(exc), re.IGNORECASE)
                 if match:
                     wait = float(match.group(1)) + 2
-                log.warning(
-                    "Gemini rate-limited (attempt %d/%d). Waiting %.0fs.",
-                    attempt, max_retries, wait,
-                )
+                log.warning("Rate-limited (attempt %d/%d). Waiting %.0fs.", attempt, max_retries, wait)
                 time.sleep(wait)
             else:
                 raise
 
     text = response.text
     if not text:
-        log.error("Gemini returned no text. Full response: %s", response)
         raise RuntimeError("Gemini returned an empty response.")
     return text
 
 
-# ── Watchlist Analysis ─────────────────────────────────────────────────────
+def _parse_json_response(text: str) -> dict:
+    """Extract JSON from Gemini response (handles markdown code blocks)."""
+    # Try to find JSON in code block
+    json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if json_match:
+        return json.loads(json_match.group(1))
+    # Try raw JSON
+    brace_start = text.find("{")
+    brace_end = text.rfind("}") + 1
+    if brace_start >= 0 and brace_end > brace_start:
+        return json.loads(text[brace_start:brace_end])
+    raise ValueError(f"No JSON found in response: {text[:200]}")
 
 
-def analyse_watchlist_symbol(client: genai.Client, symbol: str, financial_context: str) -> str:
-    """Concise analysis of a watchlist symbol."""
-    prompt = f"""You are a stock analyst. Give a BRIEF analysis of {symbol}.
-
-Live data: {financial_context}
-
-In 3-4 sentences max, cover:
-1. What the company does and its moat
-2. Is it undervalued or overvalued? (use the P/E, growth, margins above)
-3. Key risk and key catalyst
-4. Verdict: BUY / HOLD / SELL with one-line reasoning
-
-Be direct and specific with numbers. No headers or bullet points."""
-    return _call_gemini(client, prompt)
+# ── Stock Analysis (structured) ──────────────────────────────────────────────
 
 
-# ── Market Overview (with VIX) ────────────────────────────────────────────
-
-
-def analyse_market_overview(
-    client: genai.Client,
-    market_data: dict[str, dict],
-    vix_data: dict,
-    positions: list[dict[str, Any]],
-) -> str:
-    """
-    Concise market overview using real index data + VIX.
-    Returns a short analysis string.
-    """
-    # Build market data summary
-    index_lines = []
-    for name, data in market_data.items():
-        change = data.get("change_pct", 0)
-        direction = "+" if change >= 0 else ""
-        index_lines.append(f"- {name}: {data.get('price', 0):,.0f} ({direction}{change:.2f}%)")
-
-    index_summary = "\n".join(index_lines)
-
-    vix_current = vix_data.get("current", 0)
-    vix_change = vix_data.get("change_pct", 0)
-    vix_sentiment = vix_data.get("sentiment", "N/A")
-
-    ticker_list = ", ".join(pos.get("ticker", "N/A") for pos in positions[:30])
-
-    prompt = f"""You are a macro strategist. Give a BRIEF daily market briefing (max 5 sentences).
-
-Market data right now:
-{index_summary}
-- VIX: {vix_current:.2f} ({'+' if vix_change >= 0 else ''}{vix_change:.1f}%) — {vix_sentiment}
-
-My holdings: {ticker_list}
-
-Cover: overall market direction, VIX signal, which of my holdings benefit/face headwinds, one key event to watch.
-Be direct. No headers or bullet points. Use numbers."""
-    return _call_gemini(client, prompt)
-
-
-# ── Stock Analysis (concise) ──────────────────────────────────────────────
-
-
-def analyse_stock_advanced(
+def analyse_stock(
     client: genai.Client,
     symbol: str,
     financial_context: str,
     amount: Any,
     price: Any,
     weight: Any,
+    market_context: str = "",
+) -> dict:
+    """
+    Analyse a stock and return structured data.
+    Returns: {verdict, fair_value, risk, key_note}
+    """
+    prompt = f"""You are a senior equity analyst. Analyse {symbol} and return ONLY a JSON object.
+
+Live data: {financial_context}
+Position: {amount} shares at ${price}, weight: {weight}%
+Market context: {market_context}
+
+Criteria to evaluate:
+- P/E vs industry average (undervalued if below)
+- Revenue growth consistency
+- Profit margin trend
+- Debt-to-equity vs peers
+- Sentiment vs fundamentals gap (is market mispricing it?)
+- Free cash flow strength
+
+Return ONLY this JSON (no other text):
+{{
+  "verdict": "STRONG BUY" or "BUY" or "HOLD" or "SELL" or "STRONG SELL",
+  "fair_value": estimated fair value as a number (e.g. 185.50),
+  "risk": risk score 1-10 (1=very safe, 10=very risky),
+  "key_note": "One sentence: why this verdict, mention the key number that matters most"
+}}"""
+
+    text = _call_gemini(client, prompt)
+    try:
+        result = _parse_json_response(text)
+        return {
+            "verdict": str(result.get("verdict", "HOLD")),
+            "fair_value": str(result.get("fair_value", "")),
+            "risk": str(result.get("risk", "5")),
+            "key_note": str(result.get("key_note", "")),
+        }
+    except (json.JSONDecodeError, ValueError) as e:
+        log.warning("Failed to parse JSON for %s, using fallback: %s", symbol, e)
+        return {
+            "verdict": "HOLD",
+            "fair_value": "",
+            "risk": "5",
+            "key_note": text[:150].replace("\n", " "),
+        }
+
+
+# ── Market Overview ──────────────────────────────────────────────────────────
+
+
+def analyse_market_overview(
+    client: genai.Client,
+    market_summary: str,
+    positions: list[dict[str, Any]],
 ) -> str:
     """
-    Concise stock analysis using real yfinance data.
-    Inspired by: undervalue screener, sentiment vs reality gap, risk-adjusted analysis.
+    Brief market interpretation. Returns a single sentence for the sheet.
+    The actual data (VIX, yields, etc.) is already in the sheet from yfinance.
+    This just adds the AI interpretation.
     """
-    prompt = f"""You are a senior equity analyst. Analyse {symbol} BRIEFLY (max 4-5 sentences).
+    ticker_list = ", ".join(pos.get("ticker", "N/A") for pos in positions[:30])
 
-Live financial data: {financial_context}
-My position: {amount} shares at ${price}, portfolio weight: {weight}%
+    prompt = f"""You are a macro strategist. Given this market data, write ONE sentence (max 30 words) summarising the overall market stance and what it means for a portfolio holding: {ticker_list}
 
-Cover in your response:
-1. Is it undervalued? (P/E vs industry, growth rate, margins)
-2. Sentiment vs fundamentals — is the market mispricing it?
-3. Top risk and nearest catalyst
-4. Action: STRONG BUY / BUY / HOLD / SELL / STRONG SELL with target price
+Market data:
+{market_summary}
 
-Be specific with numbers. No headers, no bullet points. Just a tight analytical paragraph."""
-    return _call_gemini(client, prompt)
+Return ONLY the sentence, no quotes or extra text."""
+
+    return _call_gemini(client, prompt).strip().strip('"')
 
 
-# ── Budget-aware orchestrator ──────────────────────────────────────────────
+# ── Budget ────────────────────────────────────────────────────────────────────
 
 
 class AnalysisBudget:
@@ -164,7 +167,6 @@ class AnalysisBudget:
         return self.max_requests - self.used
 
     def consume(self) -> bool:
-        """Consume one request. Returns True if budget allows, False if exhausted."""
         if self.used >= self.max_requests:
             return False
         self.used += 1

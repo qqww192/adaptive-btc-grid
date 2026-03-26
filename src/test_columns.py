@@ -1,14 +1,12 @@
 """
 test_columns.py
-Quick test script to update sheet headers and verify the new column structure.
-Run this first to set up the sheet before running the full pipeline.
+Test script to set up sheet structure and verify market data fetching.
+Run this first before the full pipeline.
 
-Usage:
-  cd src && python test_columns.py
+Usage: cd src && python test_columns.py
 """
 
 import sys
-import os
 import logging
 from dotenv import load_dotenv
 
@@ -24,30 +22,26 @@ def main() -> None:
     load_dotenv()
 
     log.info("=" * 60)
-    log.info("Column Structure Test")
+    log.info("Sheet Structure & Market Data Test")
     log.info("=" * 60)
 
-    # ── Step 1: Connect to sheet ─────────────────────────────────────────
-    log.info("")
-    log.info("STEP 1: Connecting to Google Sheet...")
+    # ── Step 1: Connect & verify tabs ────────────────────────────────────
+    log.info("\nSTEP 1: Connecting to Google Sheet...")
     try:
-        from sheets import SheetManager
+        from sheets import SheetManager, TAB_PORTFOLIO, TAB_MARKET, TAB_ALERTS
+        from sheets import PORTFOLIO_HEADERS, MARKET_HEADERS, ALERT_HEADERS
         sheet = SheetManager()
         log.info("  Connected: %s", sheet.url)
     except Exception as e:
         log.error("  FAILED: %s", e)
         sys.exit(1)
 
-    # ── Step 2: Verify headers ───────────────────────────────────────────
-    log.info("")
-    log.info("STEP 2: Checking tab headers...")
-    from sheets import TAB_PORTFOLIO, TAB_WATCHLIST, TAB_MARKET
-    from sheets import PORTFOLIO_HEADERS, WATCHLIST_HEADERS, MARKET_HEADERS
-
-    for tab, expected in [
+    # ── Step 2: Update headers ───────────────────────────────────────────
+    log.info("\nSTEP 2: Setting headers...")
+    for tab, headers in [
         (TAB_PORTFOLIO, PORTFOLIO_HEADERS),
-        (TAB_WATCHLIST, WATCHLIST_HEADERS),
         (TAB_MARKET, MARKET_HEADERS),
+        (TAB_ALERTS, ALERT_HEADERS),
     ]:
         try:
             result = sheet.sheets.spreadsheets().values().get(
@@ -55,82 +49,97 @@ def main() -> None:
                 range=f"'{tab}'!A1:Z1",
             ).execute()
             actual = result.get("values", [[]])[0]
-            if actual == expected:
-                log.info("  %s: headers OK — %s", tab, actual)
+            if actual == headers:
+                log.info("  %s: OK — %s", tab, headers)
             else:
-                log.warning("  %s: headers MISMATCH", tab)
-                log.warning("    Expected: %s", expected)
-                log.warning("    Actual:   %s", actual)
-                log.info("  Updating headers for %s...", tab)
+                log.info("  %s: Updating headers...", tab)
+                # Clear old data when headers change
+                sheet.sheets.spreadsheets().values().clear(
+                    spreadsheetId=sheet.sheet_id,
+                    range=f"'{tab}'!A:Z",
+                ).execute()
                 sheet.sheets.spreadsheets().values().update(
                     spreadsheetId=sheet.sheet_id,
                     range=f"'{tab}'!A1",
                     valueInputOption="RAW",
-                    body={"values": [expected]},
+                    body={"values": [headers]},
                 ).execute()
-                log.info("  %s headers updated.", tab)
+                log.info("  %s: Headers set — %s", tab, headers)
         except Exception as e:
             log.error("  %s: error — %s", tab, e)
 
-    # ── Step 3: Test yfinance ────────────────────────────────────────────
-    log.info("")
-    log.info("STEP 3: Testing yfinance...")
+    # ── Step 3: Test market scorecard ────────────────────────────────────
+    log.info("\nSTEP 3: Fetching market scorecard...")
     try:
-        from market_data import get_vix, get_market_indices, build_stock_context
+        from market_data import get_market_scorecard, build_market_summary
 
-        vix = get_vix()
-        log.info("  VIX: %.2f (%+.1f%%) — %s", vix["current"], vix["change_pct"], vix["sentiment"])
+        scorecard = get_market_scorecard()
+        log.info("  %d indicators fetched:", len(scorecard))
+        for row in scorecard:
+            val = row["value"]
+            chg = row.get("change_pct", "")
+            if isinstance(val, (int, float)) and isinstance(chg, (int, float)):
+                log.info("    %-15s %10.2f  %+.2f%%  [%s]", row["name"], val, chg, row["signal"])
+            else:
+                log.info("    %-15s %10s         [%s]", row["name"], val, row["signal"])
 
-        indices = get_market_indices()
-        for name, data in indices.items():
-            log.info("  %s: %,.2f (%+.2f%%)", name, data["price"], data["change_pct"])
-
-        # Test one stock
-        context = build_stock_context("AAPL")
-        log.info("  AAPL context: %s", context)
-
+        summary = build_market_summary(scorecard)
+        log.info("\n  Market summary for AI:\n  %s", summary.replace("\n", "\n  "))
     except Exception as e:
-        log.error("  yfinance test failed: %s", e)
-        log.error("  Make sure yfinance is installed: pip install yfinance")
+        log.error("  Market scorecard failed: %s", e)
         sys.exit(1)
 
-    # ── Step 4: Write sample market overview to sheet ─────────────────────
-    log.info("")
-    log.info("STEP 4: Writing sample market data to Market Overview tab...")
+    # ── Step 4: Write scorecard to sheet ─────────────────────────────────
+    log.info("\nSTEP 4: Writing scorecard to Market Overview tab...")
     try:
-        entries = []
-        for name, data in indices.items():
-            change = data.get("change_pct", 0)
-            entries.append({
-                "indicator": name,
-                "value": f"{data.get('price', 0):,.2f}",
-                "change_pct": f"{change:+.2f}%",
-                "sentiment": "Bullish" if change > 0.5 else "Bearish" if change < -0.5 else "Neutral",
-                "analysis": "",
-            })
-        entries.append({
-            "indicator": "VIX",
-            "value": f"{vix['current']:.2f}",
-            "change_pct": f"{vix['change_pct']:+.1f}%",
-            "sentiment": vix["sentiment"],
-            "analysis": "",
-        })
-        sheet.write_market_overview(entries)
-        log.info("  Market Overview tab updated with live data.")
+        sheet.write_market_overview(scorecard)
+        log.info("  Done.")
     except Exception as e:
-        log.error("  Failed to write market overview: %s", e)
+        log.error("  Failed: %s", e)
+
+    # ── Step 5: Test alert evaluation ────────────────────────────────────
+    log.info("\nSTEP 5: Testing alert evaluation...")
+    try:
+        from market_data import evaluate_alert
+
+        test_cases = [
+            ("VIX", "price", "VIX level"),
+            ("AAPL", "price", "AAPL price"),
+            ("^TNX", "price", "10Y yield"),
+        ]
+        for sym, metric, label in test_cases:
+            val = evaluate_alert(sym, metric)
+            log.info("  %s: %.2f", label, val)
+
+        alerts = sheet.get_alerts()
+        if alerts:
+            log.info("  %d alert rules found in sheet.", len(alerts))
+        else:
+            log.info("  No alert rules yet. Add rules in the Alerts tab:")
+            log.info("    Column A: Symbol (e.g. AAPL, VIX, GOLD)")
+            log.info("    Column B: Metric (price, pe, change%%)")
+            log.info("    Column C: Condition (above or below)")
+            log.info("    Column D: Threshold (e.g. 30, 150.00)")
+    except Exception as e:
+        log.error("  Alert test failed: %s", e)
 
     # ── Summary ──────────────────────────────────────────────────────────
-    log.info("")
+    log.info("\n" + "=" * 60)
+    log.info("ALL DONE")
     log.info("=" * 60)
-    log.info("ALL STEPS PASSED")
-    log.info("=" * 60)
-    log.info("New column structure:")
-    log.info("  Portfolio:       %s", PORTFOLIO_HEADERS)
-    log.info("  Watchlist:       %s", WATCHLIST_HEADERS)
-    log.info("  Market Overview: %s", MARKET_HEADERS)
-    log.info("")
     log.info("Sheet: %s", sheet.url)
+    log.info("")
+    log.info("Tab structure:")
+    log.info("  Portfolio:       %s", PORTFOLIO_HEADERS)
+    log.info("  Market Overview: %s", MARKET_HEADERS)
+    log.info("  Alerts:          %s", ALERT_HEADERS)
+    log.info("")
+    log.info("Alert examples (fill in Alerts tab):")
+    log.info("  VIX     | price   | above | 25")
+    log.info("  AAPL    | price   | below | 150")
+    log.info("  US10Y   | price   | above | 5")
+    log.info("  TSLA    | pe      | above | 80")
+    log.info("  SP500   | change%% | below | -2")
     log.info("=" * 60)
 
 

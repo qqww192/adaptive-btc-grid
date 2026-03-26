@@ -2,14 +2,14 @@
 sheets.py
 Google Sheets integration for the T212 Portfolio Checker.
 
-Manages a single spreadsheet with three tabs:
-  - Portfolio:       auto-populated from T212, with configurable priority
-  - Watchlist:       user-added symbols for research
-  - Market Overview: daily macro/sector analysis
+Three tabs:
+  - Portfolio:       Pie | Symbol | Amount | Price | Weight % | Verdict | Fair Value | Risk | Key Note | Updated
+  - Market Overview: Date | Category | Indicator | Value | Change % | Signal | Updated
+  - Alerts:          Symbol | Metric | Condition | Threshold | Current | Status | Last Checked
+                     (user fills first 4 columns, system fills last 3)
 
 Authentication: Google Service Account via GOOGLE_SA_JSON env var.
 Sheet ID: GOOGLE_SHEET_ID env var (must be set to an existing spreadsheet).
-The spreadsheet must be shared with the service account email as Editor.
 """
 
 import os
@@ -32,20 +32,22 @@ SHEET_ID: str = os.environ.get("GOOGLE_SHEET_ID", "")
 
 # Tab names
 TAB_PORTFOLIO = "Portfolio"
-TAB_WATCHLIST = "Watchlist"
 TAB_MARKET = "Market Overview"
+TAB_ALERTS = "Alerts"
 
-# Column headers for each tab
+# Column headers
 PORTFOLIO_HEADERS = [
-    "Pie", "Symbol", "Amount", "Price", "Weight %", "Analysis", "Last Updated",
-]
-
-WATCHLIST_HEADERS = [
-    "Symbol", "Analysis", "Last Updated",
+    "Pie", "Symbol", "Amount", "Price", "Weight %",
+    "Verdict", "Fair Value", "Risk", "Key Note", "Updated",
 ]
 
 MARKET_HEADERS = [
-    "Date", "Indicator", "Value", "Change %", "Sentiment", "Analysis", "Last Updated",
+    "Date", "Category", "Indicator", "Value", "Change %", "Signal", "Updated",
+]
+
+ALERT_HEADERS = [
+    "Symbol", "Metric", "Condition", "Threshold",
+    "Current", "Status", "Last Checked",
 ]
 
 
@@ -65,7 +67,7 @@ def _ensure_tabs_exist(sheets_service, sheet_id: str) -> None:
     spreadsheet = sheets_service.spreadsheets().get(spreadsheetId=sheet_id).execute()
     existing_tabs = {s["properties"]["title"] for s in spreadsheet["sheets"]}
 
-    required_tabs = [TAB_PORTFOLIO, TAB_WATCHLIST, TAB_MARKET]
+    required_tabs = [TAB_PORTFOLIO, TAB_MARKET, TAB_ALERTS]
     missing = [t for t in required_tabs if t not in existing_tabs]
     if not missing:
         return
@@ -75,15 +77,15 @@ def _ensure_tabs_exist(sheets_service, sheet_id: str) -> None:
         spreadsheetId=sheet_id, body={"requests": requests},
     ).execute()
 
-    # Write headers for newly created tabs
-    header_data = []
     headers_map = {
         TAB_PORTFOLIO: PORTFOLIO_HEADERS,
-        TAB_WATCHLIST: WATCHLIST_HEADERS,
         TAB_MARKET: MARKET_HEADERS,
+        TAB_ALERTS: ALERT_HEADERS,
     }
-    for tab in missing:
-        header_data.append({"range": f"'{tab}'!A1", "values": [headers_map[tab]]})
+    header_data = [
+        {"range": f"'{tab}'!A1", "values": [headers_map[tab]]}
+        for tab in missing
+    ]
     if header_data:
         sheets_service.spreadsheets().values().batchUpdate(
             spreadsheetId=sheet_id,
@@ -109,23 +111,22 @@ class SheetManager:
         self.url = f"https://docs.google.com/spreadsheets/d/{self.sheet_id}/edit"
 
     # ── Portfolio tab ──────────────────────────────────────────────────────────
+    # Columns: Pie | Symbol | Amount | Price | Weight % | Verdict | Fair Value | Risk | Key Note | Updated
 
     def sync_portfolio(self, positions: list[dict[str, Any]], prices: dict[str, float] | None = None) -> None:
         """
         Sync T212 positions into the Portfolio tab.
-        Merges with existing rows to preserve analysis.
-        prices: optional dict of symbol -> live price from yfinance.
+        Preserves existing analysis fields (Verdict, Fair Value, Risk, Key Note).
         """
         existing = self._read_tab(TAB_PORTFOLIO)
         existing_by_symbol: dict[str, list] = {}
         for row in existing:
-            if len(row) >= 2 and row[1]:  # Symbol in column B
+            if len(row) >= 2 and row[1]:
                 existing_by_symbol[row[1]] = row
 
         prices = prices or {}
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-        # Calculate total portfolio value for weight
         total_value = 0
         pos_data = []
         for pos in positions:
@@ -142,11 +143,13 @@ class SheetManager:
             weight = f"{value / total_value * 100:.1f}" if total_value else "0"
 
             old = existing_by_symbol.get(ticker, [])
-            analysis = old[5] if len(old) > 5 else ""
+            verdict = old[5] if len(old) > 5 else ""
+            fair_val = old[6] if len(old) > 6 else ""
+            risk = old[7] if len(old) > 7 else ""
+            key_note = old[8] if len(old) > 8 else ""
 
-            rows.append([pie_name, ticker, qty, price, weight, analysis, now])
+            rows.append([pie_name, ticker, qty, price, weight, verdict, fair_val, risk, key_note, now])
 
-        # Sort by weight descending
         rows.sort(key=lambda r: float(r[4]) if r[4] else 0, reverse=True)
 
         all_rows = [PORTFOLIO_HEADERS] + rows
@@ -154,10 +157,7 @@ class SheetManager:
         log.info("Portfolio tab synced with %d positions.", len(rows))
 
     def get_portfolio_for_analysis(self) -> list[dict]:
-        """
-        Returns portfolio stocks sorted by weight (highest first).
-        Columns: Pie, Symbol, Amount, Price, Weight %, Analysis, Last Updated
-        """
+        """Returns portfolio stocks sorted by weight (highest first)."""
         rows = self._read_tab(TAB_PORTFOLIO)
         stocks = []
         for row in rows:
@@ -165,96 +165,113 @@ class SheetManager:
                 continue
             stocks.append({
                 "symbol": row[1],
-                "pie": row[0] if len(row) > 0 else "",
+                "pie": row[0] if row else "",
                 "amount": row[2] if len(row) > 2 else 0,
                 "price": row[3] if len(row) > 3 else 0,
                 "weight": row[4] if len(row) > 4 else "0",
-                "last_updated": row[6] if len(row) > 6 else "",
             })
-        # Sort by weight descending (analyse biggest positions first)
         stocks.sort(key=lambda s: float(s.get("weight", 0)), reverse=True)
         return stocks
 
-    def update_portfolio_analysis(self, symbol: str, analysis: str) -> None:
-        """Update the analysis result and timestamp for a portfolio stock."""
+    def update_portfolio_analysis(self, symbol: str, verdict: str, fair_value: str,
+                                   risk: str, key_note: str) -> None:
+        """Update the analysis columns for a portfolio stock."""
         rows = self._read_tab(TAB_PORTFOLIO)
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         for i, row in enumerate(rows):
             if len(row) >= 2 and row[1] == symbol:
-                while len(row) < 7:
+                while len(row) < 10:
                     row.append("")
-                row[5] = analysis       # Analysis
-                row[6] = now            # Last Updated
+                row[5] = verdict
+                row[6] = fair_value
+                row[7] = risk
+                row[8] = key_note
+                row[9] = now
                 self.sheets.spreadsheets().values().update(
                     spreadsheetId=self.sheet_id,
-                    range=f"'{TAB_PORTFOLIO}'!A{i + 1}",
-                    valueInputOption="RAW",
-                    body={"values": [row]},
-                ).execute()
-                return
-
-    # ── Watchlist tab ──────────────────────────────────────────────────────────
-
-    def get_watchlist(self) -> list[dict]:
-        """Returns watchlist symbols that have been filled in by the user."""
-        rows = self._read_tab(TAB_WATCHLIST)
-        watchlist = []
-        for i, row in enumerate(rows):
-            if len(row) >= 1 and row[0]:
-                watchlist.append({
-                    "symbol": row[0],
-                    "existing_analysis": row[1] if len(row) > 1 else "",
-                    "row_index": i + 1,
-                })
-        return watchlist
-
-    def update_watchlist_analysis(self, symbol: str, analysis: str) -> None:
-        """Update analysis for a watchlist symbol."""
-        rows = self._read_tab(TAB_WATCHLIST)
-        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        for i, row in enumerate(rows):
-            if len(row) >= 1 and row[0] == symbol:
-                while len(row) < 3:
-                    row.append("")
-                row[1] = analysis    # Analysis
-                row[2] = now         # Last Updated
-                self.sheets.spreadsheets().values().update(
-                    spreadsheetId=self.sheet_id,
-                    range=f"'{TAB_WATCHLIST}'!A{i + 1}",
+                    range=f"'{TAB_PORTFOLIO}'!A{i + 2}",
                     valueInputOption="RAW",
                     body={"values": [row]},
                 ).execute()
                 return
 
     # ── Market Overview tab ────────────────────────────────────────────────────
+    # Columns: Date | Category | Indicator | Value | Change % | Signal | Updated
 
     def write_market_overview(self, entries: list[dict]) -> None:
         """
-        Write daily market overview entries.
-        Each entry: {indicator, value, change_pct, sentiment, analysis}
+        Write market scorecard rows.
+        Each entry: {category, name, value, change_pct, signal}
         """
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         existing = self._read_tab(TAB_MARKET)
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-        # Remove today's existing entries (will be replaced)
         kept = [r for r in existing if not (len(r) >= 1 and r[0] == today)]
 
         new_rows = []
-        for entry in entries:
+        for e in entries:
+            val = e.get("value", "")
+            chg = e.get("change_pct", "")
+            if isinstance(val, float):
+                val = f"{val:,.2f}"
+            if isinstance(chg, float):
+                chg = f"{chg:+.2f}%"
             new_rows.append([
                 today,
-                entry.get("indicator", ""),
-                entry.get("value", ""),
-                entry.get("change_pct", ""),
-                entry.get("sentiment", ""),
-                entry.get("analysis", ""),
+                e.get("category", ""),
+                e.get("name", ""),
+                val,
+                chg,
+                e.get("signal", ""),
                 now,
             ])
 
         all_rows = [MARKET_HEADERS] + kept + new_rows
         self._write_tab(TAB_MARKET, all_rows)
         log.info("Market Overview updated with %d entries.", len(new_rows))
+
+    def write_market_ai_summary(self, summary: str) -> None:
+        """Append a row with the AI market interpretation."""
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        row = [today, "AI", "Market Summary", "", "", summary, now]
+        self.sheets.spreadsheets().values().append(
+            spreadsheetId=self.sheet_id,
+            range=f"'{TAB_MARKET}'!A:G",
+            valueInputOption="RAW",
+            body={"values": [row]},
+        ).execute()
+
+    # ── Alerts tab ─────────────────────────────────────────────────────────────
+    # Columns: Symbol | Metric | Condition | Threshold | Current | Status | Last Checked
+    # User fills columns A-D, system fills E-G
+
+    def get_alerts(self) -> list[dict]:
+        """Read alert rules set by the user (rows with at least Symbol + Metric + Condition + Threshold)."""
+        rows = self._read_tab(TAB_ALERTS)
+        alerts = []
+        for i, row in enumerate(rows):
+            if len(row) >= 4 and row[0] and row[1] and row[2] and row[3]:
+                alerts.append({
+                    "symbol": row[0],
+                    "metric": row[1],
+                    "condition": row[2],    # above / below
+                    "threshold": row[3],
+                    "row_index": i + 2,     # +2 for header + 0-indexed
+                })
+        return alerts
+
+    def update_alert_status(self, row_index: int, current_value: float, triggered: bool) -> None:
+        """Update columns E-G for an alert row."""
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        status = "TRIGGERED" if triggered else "OK"
+        self.sheets.spreadsheets().values().update(
+            spreadsheetId=self.sheet_id,
+            range=f"'{TAB_ALERTS}'!E{row_index}",
+            valueInputOption="RAW",
+            body={"values": [[f"{current_value:.2f}", status, now]]},
+        ).execute()
 
     # ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -266,19 +283,17 @@ class SheetManager:
                 range=f"'{tab_name}'!A:Z",
             ).execute()
             rows = result.get("values", [])
-            return rows[1:] if len(rows) > 1 else []  # skip header
+            return rows[1:] if len(rows) > 1 else []
         except HttpError as e:
             log.warning("Failed to read tab '%s': %s", tab_name, e)
             return []
 
     def _write_tab(self, tab_name: str, rows: list[list]) -> None:
         """Overwrite an entire tab with the given rows (including header)."""
-        # Clear existing content
         self.sheets.spreadsheets().values().clear(
             spreadsheetId=self.sheet_id,
             range=f"'{tab_name}'!A:Z",
         ).execute()
-        # Write new content
         if rows:
             self.sheets.spreadsheets().values().update(
                 spreadsheetId=self.sheet_id,
@@ -286,12 +301,3 @@ class SheetManager:
                 valueInputOption="RAW",
                 body={"values": rows},
             ).execute()
-
-
-def _detect_market(ticker: str) -> str:
-    """Simple heuristic to detect US vs UK market from ticker format."""
-    # T212 UK tickers often end with _EQ (e.g., BARC_EQ), or have suffixes like .L
-    if ticker.endswith("_EQ") or ".L" in ticker or ticker.endswith("_LSE"):
-        return "UK"
-    # Most other tickers are US
-    return "US"
