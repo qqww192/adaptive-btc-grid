@@ -28,8 +28,8 @@ def main() -> None:
     # ── Step 1: Connect & verify tabs ────────────────────────────────────
     log.info("\nSTEP 1: Connecting to Google Sheet...")
     try:
-        from sheets import SheetManager, TAB_PORTFOLIO, TAB_MARKET, TAB_SIGNALS, TAB_ALERTS
-        from sheets import PORTFOLIO_HEADERS, MARKET_HEADERS, SIGNAL_HEADERS, ALERT_HEADERS
+        from sheets import SheetManager, TAB_PORTFOLIO, TAB_SIGNALS, TAB_ALERTS
+        from sheets import PORTFOLIO_HEADERS, SIGNAL_HEADERS, ALERT_HEADERS
         sheet = SheetManager()
         log.info("  Connected: %s", sheet.url)
     except Exception as e:
@@ -40,7 +40,6 @@ def main() -> None:
     log.info("\nSTEP 2: Setting headers...")
     for tab, headers in [
         (TAB_PORTFOLIO, PORTFOLIO_HEADERS),
-        (TAB_MARKET, MARKET_HEADERS),
         (TAB_SIGNALS, SIGNAL_HEADERS),
         (TAB_ALERTS, ALERT_HEADERS),
     ]:
@@ -54,7 +53,6 @@ def main() -> None:
                 log.info("  %s: OK — %s", tab, headers)
             else:
                 log.info("  %s: Updating headers...", tab)
-                # Clear old data when headers change
                 sheet.sheets.spreadsheets().values().clear(
                     spreadsheetId=sheet.sheet_id,
                     range=f"'{tab}'!A:Z",
@@ -90,15 +88,15 @@ def main() -> None:
         log.error("  Market scorecard failed: %s", e)
         sys.exit(1)
 
-    # ── Step 4: Write scorecard to sheet ─────────────────────────────────
-    log.info("\nSTEP 4: Writing scorecard to Market Overview tab...")
+    # ── Step 4: Write scorecard to Signals tab ───────────────────────────
+    log.info("\nSTEP 4: Writing scorecard to Signals tab...")
     try:
         sheet.write_market_overview(scorecard)
         log.info("  Done.")
     except Exception as e:
         log.error("  Failed: %s", e)
 
-    # ── Step 5: Signal metrics ─────────────────────────────────────────
+    # ── Step 5: Signal metrics ───────────────────────────────────────────
     log.info("\nSTEP 5: Computing high-reliability signal metrics...")
     try:
         from market_data import get_signal_metrics
@@ -109,7 +107,7 @@ def main() -> None:
             log.info("    %-25s %10s  %-20s [%s] (%s)",
                      s["name"], s["value"], s["reading"], s["signal"], s["success_rate"])
 
-        sheet.write_signals(signals)
+        sheet.write_signals(signals, signal_type="Signal")
         log.info("  Signals written to sheet.")
     except Exception as e:
         log.error("  Signal metrics failed: %s", e)
@@ -137,6 +135,7 @@ def main() -> None:
             log.info("    Column B: Metric (price, pe, change%%)")
             log.info("    Column C: Condition (above or below)")
             log.info("    Column D: Threshold (e.g. 30, 150.00)")
+            log.info("    Column E: Type (one-time or recurring)")
     except Exception as e:
         log.error("  Alert test failed: %s", e)
 
@@ -147,17 +146,16 @@ def main() -> None:
     log.info("Sheet: %s", sheet.url)
     log.info("")
     log.info("Tab structure:")
-    log.info("  Portfolio:       %s", PORTFOLIO_HEADERS)
-    log.info("  Market Overview: %s", MARKET_HEADERS)
-    log.info("  Signals:         %s", SIGNAL_HEADERS)
-    log.info("  Alerts:          %s", ALERT_HEADERS)
+    log.info("  Portfolio: %s", PORTFOLIO_HEADERS)
+    log.info("  Signals:   %s", SIGNAL_HEADERS)
+    log.info("  Alerts:    %s", ALERT_HEADERS)
     log.info("")
     log.info("Alert examples (fill in Alerts tab):")
-    log.info("  VIX     | price   | above | 25")
-    log.info("  AAPL    | price   | below | 150")
-    log.info("  US10Y   | price   | above | 5")
-    log.info("  TSLA    | pe      | above | 80")
-    log.info("  SP500   | change%% | below | -2")
+    log.info("  VIX     | price   | above | 25  | recurring")
+    log.info("  AAPL    | price   | below | 150 | one-time")
+    log.info("  US10Y   | price   | above | 5   | recurring")
+    log.info("  TSLA    | pe      | above | 80  | one-time")
+    log.info("  SP500   | change%% | below | -2  | recurring")
     log.info("=" * 60)
 
 

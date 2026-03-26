@@ -1,0 +1,84 @@
+"""
+telegram_notify.py
+Send notifications via Telegram Bot API.
+
+Env vars: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+"""
+
+import json
+import logging
+import os
+import urllib.request
+import urllib.error
+
+log = logging.getLogger(__name__)
+
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+API_URL = "https://api.telegram.org/bot{token}/sendMessage"
+
+
+def send_message(text: str, parse_mode: str = "HTML") -> bool:
+    """Send a message via Telegram. Returns True on success."""
+    if not BOT_TOKEN or not CHAT_ID:
+        log.warning("Telegram not configured (missing BOT_TOKEN or CHAT_ID). Skipping.")
+        return False
+
+    url = API_URL.format(token=BOT_TOKEN)
+    payload = json.dumps({
+        "chat_id": CHAT_ID,
+        "text": text[:4090],
+        "parse_mode": parse_mode,
+        "disable_web_page_preview": True,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        url, data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = json.loads(resp.read())
+            if body.get("ok"):
+                log.info("Telegram message sent.")
+                return True
+            log.error("Telegram API error: %s", body)
+            return False
+    except urllib.error.URLError as e:
+        log.error("Telegram unreachable: %s", e)
+        return False
+
+
+def notify_alert_triggered(alert: dict, current_value: float) -> None:
+    """Send a Telegram notification for a triggered alert."""
+    text = (
+        f"<b>ALERT TRIGGERED</b>\n\n"
+        f"<b>{alert['symbol']}</b> {alert['metric']}\n"
+        f"Condition: {alert['condition']} {alert['threshold']}\n"
+        f"Current: <b>{current_value:.2f}</b>\n\n"
+        f"Type: {alert.get('type', 'recurring')}"
+    )
+    send_message(text)
+
+
+def notify_high_risk(source: str, details: str) -> None:
+    """Send a Telegram notification for high-risk detection."""
+    text = (
+        f"<b>HIGH RISK DETECTED</b>\n"
+        f"Source: {source}\n\n"
+        f"{details}"
+    )
+    send_message(text)
+
+
+def notify_portfolio_risk(symbol: str, risk: str, verdict: str, key_note: str) -> None:
+    """Send a Telegram notification when AI detects high risk on a stock."""
+    text = (
+        f"<b>PORTFOLIO RISK ALERT</b>\n\n"
+        f"<b>{symbol}</b>\n"
+        f"Verdict: {verdict}\n"
+        f"Risk: {risk}/10\n"
+        f"Note: {key_note}"
+    )
+    send_message(text)
