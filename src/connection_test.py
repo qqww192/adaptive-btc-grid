@@ -35,7 +35,7 @@ def test_t212_connection() -> bool:
     credentials = base64.b64encode(f"{api_key}:{secret_key}".encode()).decode()
     headers = {"Authorization": f"Basic {credentials}"}
     try:
-        resp = httpx.get(f"{T212_BASE}/equity/portfolio", headers=headers, timeout=TIMEOUT)
+        resp = httpx.get(f"{T212_BASE}/equity/positions", headers=headers, timeout=TIMEOUT)
         resp.raise_for_status()
         positions = resp.json()
         log.info(f"  PASS — Trading 212 connected. {len(positions)} positions found.")
