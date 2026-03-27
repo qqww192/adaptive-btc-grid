@@ -117,7 +117,7 @@ def main() -> None:
     except Exception as e:
         log.error("  Signal metrics failed: %s", e)
 
-    # 2b: AI interpretation of signals
+    # 2b: AI interpretation of signals + Telegram if risk detected
     if not budget.exhausted and signals_summary:
         log.info("Step 2b — AI signal interpretation...")
         if budget.consume():
@@ -126,6 +126,15 @@ def main() -> None:
                 ai_summary = analyse_market_overview(gemini, signals_summary, positions_for_ai)
                 sheet.write_signal_ai_summary(ai_summary)
                 log.info("  AI signals summary: %s", ai_summary[:120])
+                # Check if AI summary mentions high risk / bearish sentiment
+                risk_keywords = ["high risk", "bearish", "sell-off", "crash", "correction",
+                                 "recession", "extreme fear", "danger", "caution"]
+                summary_lower = ai_summary.lower()
+                if any(kw in summary_lower for kw in risk_keywords):
+                    telegram_notify.notify_high_risk(
+                        "AI Signal Summary", ai_summary,
+                    )
+                    high_risk_items.append(f"AI Signals: {ai_summary[:100]}")
             except Exception as e:
                 log.error("  AI signal interpretation failed: %s", e)
 
@@ -148,10 +157,14 @@ def main() -> None:
         log.info("  Live prices fetched for %d/%d symbols.", len(live_prices), len(t212_tickers))
         sheet.sync_portfolio(positions, prices=live_prices)
 
-    # ── Step 4: AI stock analysis ─────────────────────────────────────────
+    # ── Step 4: AI stock analysis (checkbox + stalest first, max 15) ────────
     if not budget.exhausted:
         log.info("Step 4 — Analysing stocks (budget: %d remaining)...", budget.remaining)
-        stocks = sheet.get_portfolio_for_analysis()
+        stocks = sheet.get_portfolio_for_analysis(max_tickers=15)
+        if not stocks:
+            log.info("  No stocks have AI Analyse checked. Skipping.")
+        else:
+            log.info("  %d stocks queued for AI (sorted by stalest AI Updated).", len(stocks))
         analysed = 0
         for stock in stocks:
             if budget.exhausted:
@@ -159,7 +172,9 @@ def main() -> None:
                 break
             symbol = stock["symbol"]
             yf_symbol = t212_to_yfinance(symbol)
-            log.info("  Analysing %s → %s (weight %s%%)...", symbol, yf_symbol, stock.get("weight", "0"))
+            stale_info = stock.get("ai_updated", "never")
+            log.info("  Analysing %s → %s (weight %s%%, last AI: %s)...",
+                     symbol, yf_symbol, stock.get("weight", "0"), stale_info or "never")
             if not budget.consume():
                 break
             try:

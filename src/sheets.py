@@ -41,8 +41,8 @@ TAB_ALERTS = "Alerts"
 # Column headers
 PORTFOLIO_HEADERS = [
     "Pie", "Symbol", "Name", "Qty", "Avg Price", "Current Price", "P/L",
-    "Value", "Weight %",
-    "Verdict", "Fair Value", "Risk", "Key Note", "Updated",
+    "Value", "Weight %", "AI Analyse",
+    "Verdict", "Fair Value", "Risk", "Key Note", "Price Updated", "AI Updated",
 ]
 
 SIGNAL_HEADERS = [
@@ -117,13 +117,15 @@ class SheetManager:
 
     # ── Portfolio tab ──────────────────────────────────────────────────────────
     # Columns: Pie | Symbol | Name | Qty | Avg Price | Current Price | P/L
-    #          | Value | Weight % | Verdict | Fair Value | Risk | Key Note | Updated
+    #          | Value | Weight % | AI Analyse | Verdict | Fair Value | Risk
+    #          | Key Note | Price Updated | AI Updated
 
     def sync_portfolio(self, positions: list[dict[str, Any]], prices: dict[str, float] | None = None) -> None:
         """
         Sync T212 positions into the Portfolio tab.
         Positions come from fetch_portfolio.fetch_portfolio() (pies endpoint).
-        Preserves existing analysis fields (Verdict, Fair Value, Risk, Key Note).
+        Preserves: AI Analyse checkbox, analysis fields, and AI Updated timestamp.
+        Only updates Price Updated timestamp.
         """
         existing = self._read_tab(TAB_PORTFOLIO)
         # Key by symbol (col B, index 1)
@@ -156,17 +158,24 @@ class SheetManager:
             weight = f"{value / total_value * 100:.1f}" if total_value else "0"
 
             old = existing_by_symbol.get(ticker, [])
-            # Analysis columns are at indices 9-12 in new layout
-            verdict = old[9] if len(old) > 9 else ""
-            fair_val = old[10] if len(old) > 10 else ""
-            risk = old[11] if len(old) > 11 else ""
-            key_note = old[12] if len(old) > 12 else ""
+            # Preserve user-set AI Analyse checkbox (index 9)
+            ai_analyse = old[9] if len(old) > 9 else ""
+            # Analysis columns at indices 10-13
+            verdict = old[10] if len(old) > 10 else ""
+            fair_val = old[11] if len(old) > 11 else ""
+            risk = old[12] if len(old) > 12 else ""
+            key_note = old[13] if len(old) > 13 else ""
+            # Preserve AI Updated timestamp (index 15)
+            ai_updated = old[15] if len(old) > 15 else ""
 
             rows.append([
                 pie_name, ticker, name, qty,
                 f"{avg_price:.2f}", f"{current_price:.2f}",
                 f"{ppl:.2f}", f"{value:.2f}", weight,
-                verdict, fair_val, risk, key_note, now,
+                ai_analyse,
+                verdict, fair_val, risk, key_note,
+                now,        # Price Updated
+                ai_updated, # AI Updated (preserved)
             ])
 
         rows.sort(key=lambda r: float(r[8]) if r[8] else 0, reverse=True)
@@ -175,12 +184,20 @@ class SheetManager:
         self._write_tab(TAB_PORTFOLIO, all_rows)
         log.info("Portfolio tab synced with %d positions. Total: £%.2f", len(rows), total_value)
 
-    def get_portfolio_for_analysis(self) -> list[dict]:
-        """Returns portfolio stocks sorted by weight (highest first)."""
+    def get_portfolio_for_analysis(self, max_tickers: int = 15) -> list[dict]:
+        """
+        Returns portfolio stocks that have AI Analyse checked,
+        sorted by stalest AI Updated timestamp first (oldest/empty first).
+        Limited to max_tickers per run.
+        """
         rows = self._read_tab(TAB_PORTFOLIO)
         stocks = []
         for row in rows:
             if len(row) < 2 or not row[1]:
+                continue
+            ai_analyse = (row[9].strip().upper() if len(row) > 9 and row[9] else "")
+            # Only include rows where AI Analyse is checked (TRUE, YES, Y, 1, X, ✓)
+            if ai_analyse not in ("TRUE", "YES", "Y", "1", "X", "✓"):
                 continue
             stocks.append({
                 "pie": row[0] if row else "",
@@ -192,25 +209,29 @@ class SheetManager:
                 "ppl": row[6] if len(row) > 6 else 0,
                 "value": row[7] if len(row) > 7 else 0,
                 "weight": row[8] if len(row) > 8 else "0",
+                "ai_updated": row[15] if len(row) > 15 and row[15] else "",
             })
-        stocks.sort(key=lambda s: float(s.get("weight", 0)), reverse=True)
-        return stocks
+        # Sort by stalest AI Updated (empty string sorts first = never analysed)
+        stocks.sort(key=lambda s: s.get("ai_updated", ""))
+        return stocks[:max_tickers]
 
     def update_portfolio_analysis(self, symbol: str, verdict: str, fair_value: str,
                                    risk: str, key_note: str) -> None:
-        """Update the analysis columns for a portfolio stock (cols J-N)."""
+        """Update the analysis columns for a portfolio stock (cols K-P)."""
         rows = self._read_tab(TAB_PORTFOLIO)
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         for i, row in enumerate(rows):
             # Symbol is column B (index 1)
             if len(row) >= 2 and row[1] == symbol:
-                while len(row) < 14:
+                while len(row) < 16:
                     row.append("")
-                row[9] = verdict
-                row[10] = fair_value
-                row[11] = risk
-                row[12] = key_note
-                row[13] = now
+                # Index 9 = AI Analyse (preserved, don't touch)
+                row[10] = verdict
+                row[11] = fair_value
+                row[12] = risk
+                row[13] = key_note
+                # Index 14 = Price Updated (preserved, don't touch)
+                row[15] = now  # AI Updated
                 self.sheets.spreadsheets().values().update(
                     spreadsheetId=self.sheet_id,
                     range=f"'{TAB_PORTFOLIO}'!A{i + 2}",
