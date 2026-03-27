@@ -1,31 +1,15 @@
 """
 fetch_portfolio.py
-Fetches all open positions and pie info from the Trading 212 API.
+Fetches portfolio data from the Trading 212 API via the Pies endpoint.
 
-API docs: https://docs.trading212.com/api/positions
+API docs: https://docs.trading212.com/api/pies-(deprecated)/getall
 Endpoints:
-  - GET /equity/positions — all open positions
-  - GET /equity/pies      — all pies (name, id, instruments)
+  - GET /equity/pies         — list all pies (id, cash, progress)
+  - GET /equity/pies/{id}    — pie detail with instruments
 
-T212 Position response format (camelCase):
-  {
-    "instrument": {"currency": "GBX", "isin": "...", "name": "...", "ticker": "VUAG_EQ_L"},
-    "quantity": 5.138,
-    "averagePricePaid": 247.50,
-    "currentPrice": 24781.35,        # in instrument currency (e.g. GBX = pence)
-    "quantityAvailableForTrading": 5.138,
-    "quantityInPies": 5.138,
-    "createdAt": "2024-...",
-    "walletImpact": {
-      "currency": "GBP",
-      "currentValue": 1273.26,        # in account currency
-      "fxImpact": 0,
-      "totalCost": 1208.46,
-      "unrealizedProfitLoss": 64.80
-    }
-  }
-
-Note: London-listed instruments may be priced in GBX (pence). We convert to GBP.
+Each instrument in a pie has:
+  ticker, name, ownedQuantity, currentShare, expectedShare,
+  result: {investedValue, result, resultCoef, value}
 
 Auth: Basic Auth (API_KEY:SECRET_KEY base64-encoded) or legacy API key header.
 """
@@ -43,9 +27,8 @@ log = logging.getLogger(__name__)
 BASE_URL = "https://live.trading212.com/api/v0"
 TIMEOUT = 30  # seconds
 
-# Currencies where price is in minor units (pence, cents)
-# and needs dividing by 100 to get the major unit (GBP, etc.)
-MINOR_CURRENCY_CODES = {"GBX", "GBp", "ILA"}  # GBX=pence, ILA=Israeli agora
+# Currencies where price is in minor units (pence)
+MINOR_CURRENCY_CODES = {"GBX", "GBp", "ILA"}
 
 
 def _get_headers() -> dict[str, str]:
@@ -64,148 +47,151 @@ def _get_headers() -> dict[str, str]:
         return {"Authorization": api_key}
 
 
-def _normalise_position(raw: dict) -> dict:
-    """
-    Normalise a T212 API position into a flat, consistent format.
-
-    Handles the nested response structure:
-      - instrument.ticker → ticker
-      - instrument.name → name
-      - instrument.currency → currency
-      - averagePricePaid → averagePrice
-      - walletImpact.unrealizedProfitLoss → ppl
-      - walletImpact.currentValue → value (in account currency)
-    """
-    # Extract instrument info (nested object)
-    instrument = raw.get("instrument") or {}
-    ticker = instrument.get("ticker", "")
-    name = instrument.get("name", "")
-    currency = instrument.get("currency", "")
-    isin = instrument.get("isin", "")
-
-    # Core position data
-    qty = float(raw.get("quantity") or 0)
-    avg_price = float(raw.get("averagePricePaid") or 0)
-    current_price = float(raw.get("currentPrice") or 0)
-    qty_in_pies = float(raw.get("quantityInPies") or 0)
-
-    # Convert minor currency (GBX pence) to major currency (GBP)
-    if currency.upper() in MINOR_CURRENCY_CODES:
-        avg_price = avg_price / 100
-        current_price = current_price / 100
-
-    # Wallet impact (P/L, value in account currency)
-    wallet = raw.get("walletImpact") or {}
-    ppl = float(wallet.get("unrealizedProfitLoss") or 0)
-    value = float(wallet.get("currentValue") or 0)
-    total_cost = float(wallet.get("totalCost") or 0)
-    fx_impact = float(wallet.get("fxImpact") or 0)
-    account_currency = wallet.get("currency", "GBP")
-
-    return {
-        "ticker": ticker,
-        "name": name,
-        "isin": isin,
-        "currency": currency,
-        "accountCurrency": account_currency,
-        "quantity": qty,
-        "averagePrice": avg_price,
-        "currentPrice": current_price,
-        "ppl": ppl,
-        "fxImpact": fx_impact,
-        "value": value,
-        "totalCost": total_cost,
-        "quantityInPies": qty_in_pies,
-    }
-
-
-def fetch_all_positions() -> list[dict[str, Any]]:
-    """
-    Fetches all open positions from Trading 212.
-
-    Returns a list of normalised position dicts with consistent field names.
-    """
+def _get(client: httpx.Client, path: str) -> Any:
+    """GET request with auth headers and error handling."""
     headers = _get_headers()
+    resp = client.get(f"{BASE_URL}{path}", headers=headers)
+    resp.raise_for_status()
+    return resp.json()
 
+
+def fetch_all_pies() -> list[dict[str, Any]]:
+    """
+    Fetches all pies (summary) from Trading 212.
+    Returns list of: {id, cash, dividendDetails, progress, status}
+    """
     try:
         with httpx.Client(timeout=TIMEOUT) as client:
-            resp = client.get(
-                f"{BASE_URL}/equity/positions",
-                headers=headers,
-            )
-            resp.raise_for_status()
-            data = resp.json()
+            pies = _get(client, "/equity/pies")
 
-        # Handle both array response and paginated {items: [...]} response
-        if isinstance(data, list):
-            raw_positions = data
-        elif isinstance(data, dict):
-            raw_positions = data.get("items") or data.get("positions") or [data]
-            log.info("T212 response is dict with keys: %s", list(data.keys()))
-        else:
-            log.error("Unexpected T212 response type: %s", type(data))
-            return []
-
-        log.info("Fetched %d positions from Trading 212.", len(raw_positions))
-
-        # Dump raw JSON for debugging
-        if raw_positions:
-            log.info("T212 RAW (pos 1 of %d): %s",
-                     len(raw_positions),
-                     json.dumps(raw_positions[0], default=str, indent=2))
-
-        # Normalise all positions
-        positions = [_normalise_position(p) for p in raw_positions]
-
-        for p in positions[:10]:
-            log.info("  %-15s %-40s qty=%.4f avg=£%.2f price=£%.2f P/L=£%.2f value=£%.2f",
-                     p["ticker"], p["name"][:40], p["quantity"],
-                     p["averagePrice"], p["currentPrice"],
-                     p["ppl"], p["value"])
-
-        total_value = sum(p["value"] for p in positions)
-        log.info("  TOTAL portfolio value: £%.2f (%d positions)", total_value, len(positions))
-
-        return positions
-
-    except httpx.HTTPStatusError as e:
-        log.error("Trading 212 API error: %s — %s", e.response.status_code, e.response.text)
-        raise
-    except httpx.RequestError as e:
-        log.error("Network error contacting Trading 212: %s", e)
-        raise
-
-
-def fetch_pies() -> list[dict[str, Any]]:
-    """
-    Fetches all pies from Trading 212.
-    Returns a list of pie dicts with id, name, instruments, etc.
-    """
-    headers = _get_headers()
-
-    try:
-        with httpx.Client(timeout=TIMEOUT) as client:
-            resp = client.get(
-                f"{BASE_URL}/equity/pies",
-                headers=headers,
-            )
-            resp.raise_for_status()
-            pies = resp.json()
+        if not isinstance(pies, list):
+            log.warning("Unexpected pies response type: %s", type(pies))
+            pies = pies.get("items", []) if isinstance(pies, dict) else []
 
         log.info("Fetched %d pies from Trading 212.", len(pies))
         if pies:
-            log.info("T212 RAW PIE (first): %s",
+            log.info("T212 RAW PIE SUMMARY (first): %s",
                      json.dumps(pies[0], default=str))
-        for pie in pies:
-            log.info("  Pie: id=%s", pie.get("id"))
         return pies
 
     except httpx.HTTPStatusError as e:
-        log.error("Trading 212 pies API error: %s — %s", e.response.status_code, e.response.text)
-        return []
+        log.error("T212 pies API error: %s — %s", e.response.status_code, e.response.text)
+        raise
     except httpx.RequestError as e:
         log.error("Network error fetching pies: %s", e)
+        raise
+
+
+def fetch_pie_detail(pie_id: int) -> dict[str, Any]:
+    """
+    Fetches detail for a single pie including all instruments.
+
+    Returns: {settings: {name, ...}, instruments: [{ticker, name, ownedQuantity,
+              currentShare, result: {value, investedValue, result, resultCoef}, ...}],
+              cash, dividendDetails, progress}
+    """
+    try:
+        with httpx.Client(timeout=TIMEOUT) as client:
+            detail = _get(client, f"/equity/pies/{pie_id}")
+
+        log.info("Fetched pie %d: %s (%d instruments)",
+                 pie_id,
+                 detail.get("settings", {}).get("name", "?"),
+                 len(detail.get("instruments", [])))
+        return detail
+
+    except httpx.HTTPStatusError as e:
+        log.error("T212 pie detail API error for %d: %s — %s",
+                  pie_id, e.response.status_code, e.response.text)
+        return {}
+    except httpx.RequestError as e:
+        log.error("Network error fetching pie %d: %s", pie_id, e)
+        return {}
+
+
+def fetch_portfolio() -> list[dict[str, Any]]:
+    """
+    Fetches all positions across all pies.
+    Calls GET /equity/pies then GET /equity/pies/{id} for each.
+
+    Returns a flat list of normalised position dicts:
+      {ticker, name, pieName, quantity, value, investedValue, ppl, currentShare, weight}
+    """
+    pies_summary = fetch_all_pies()
+    if not pies_summary:
         return []
+
+    all_positions = []
+
+    for pie_summary in pies_summary:
+        pie_id = pie_summary.get("id")
+        if not pie_id:
+            continue
+
+        detail = fetch_pie_detail(pie_id)
+        if not detail:
+            continue
+
+        pie_name = detail.get("settings", {}).get("name", f"Pie {pie_id}")
+        instruments = detail.get("instruments", [])
+
+        # Log raw first instrument for debugging
+        if instruments:
+            log.info("  RAW instrument (first in %s): %s",
+                     pie_name, json.dumps(instruments[0], default=str))
+
+        for inst in instruments:
+            ticker = inst.get("ticker", "")
+            if not ticker:
+                continue
+
+            result = inst.get("result") or {}
+            value = float(result.get("value", 0))
+            invested = float(result.get("investedValue", 0))
+            ppl = float(result.get("result", 0))
+
+            qty = float(inst.get("ownedQuantity", 0))
+            current_share = float(inst.get("currentShare", 0))
+            currency_code = inst.get("currencyCode", "")
+
+            # Compute current price from value/qty
+            current_price = (value / qty) if qty > 0 else 0
+            avg_price = (invested / qty) if qty > 0 else 0
+
+            # Convert minor currencies (GBX pence → GBP)
+            if currency_code.upper() in MINOR_CURRENCY_CODES:
+                current_price = current_price / 100
+                avg_price = avg_price / 100
+
+            all_positions.append({
+                "ticker": ticker,
+                "name": inst.get("name", ""),
+                "pieName": pie_name,
+                "quantity": qty,
+                "averagePrice": avg_price,
+                "currentPrice": current_price,
+                "value": value,
+                "investedValue": invested,
+                "ppl": ppl,
+                "currentShare": current_share,
+                "currencyCode": currency_code,
+            })
+
+    # Log summary
+    total_value = sum(p["value"] for p in all_positions)
+    log.info("Portfolio: %d positions across %d pies. Total value: £%.2f",
+             len(all_positions), len(pies_summary), total_value)
+    for p in all_positions:
+        weight = (p["value"] / total_value * 100) if total_value else 0
+        log.info("  [%s] %-15s %-35s qty=%.4f value=£%.2f (%.1f%%)",
+                 p["pieName"][:10], p["ticker"], p["name"][:35],
+                 p["quantity"], p["value"], weight)
+
+    return all_positions
+
+
+# Keep old name as alias for backward compatibility in pipeline files
+fetch_all_positions = fetch_portfolio
 
 
 def t212_to_yfinance(t212_ticker: str) -> str:
@@ -214,19 +200,10 @@ def t212_to_yfinance(t212_ticker: str) -> str:
 
     T212 uses: VUAG_EQ_L, AAPL_US_EQ, CSPX_EQ_L, BRK.B_US_EQ, etc.
     yfinance uses: VUAG.L, AAPL, CSPX.L, BRK-B, etc.
-
-    Exchange suffixes:
-      _L  → .L (London Stock Exchange)
-      _US → (no suffix, US default)
-      _DE → .DE (Frankfurt)
-      _AS → .AS (Amsterdam)
-      _PA → .PA (Paris)
-      _MI → .MI (Milan)
     """
     if not t212_ticker or t212_ticker == "UNKNOWN":
         return t212_ticker
 
-    # Map T212 exchange codes to yfinance suffixes
     exchange_map = {
         "L": ".L",
         "US": "",
@@ -244,17 +221,14 @@ def t212_to_yfinance(t212_ticker: str) -> str:
     parts = t212_ticker.split("_")
     symbol = parts[0]
 
-    # yfinance uses dashes instead of dots in symbols like BRK-B
-    # T212 might use BRK.B_US_EQ
-    # Actually yfinance uses BRK-B for Berkshire B shares
+    # yfinance uses dashes not dots in symbols like BRK-B
     yf_symbol = symbol.replace(".", "-") if "." in symbol else symbol
 
-    # Find exchange code in the parts (skip "EQ" which is just equity type)
+    # Find exchange code (skip "EQ" which is just equity type)
     for part in parts[1:]:
         if part == "EQ":
             continue
         if part in exchange_map:
             return f"{yf_symbol}{exchange_map[part]}"
 
-    # Default: just the base symbol
     return yf_symbol

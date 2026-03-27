@@ -1,12 +1,12 @@
 """
 fetch_and_sync.py
-Fetch T212 portfolio + yfinance prices → sync to Google Sheet.
+Fetch T212 portfolio (via pies) + yfinance signals → sync to Google Sheet.
 No AI, no Gemini. Just data.
 
 Pipeline priority (same as main.py but without AI):
   1. Evaluate alerts → Telegram if triggered
-  2. Market scorecard + signals → Signals tab
-  3. T212 portfolio → Portfolio tab
+  2. Signal metrics → Signals tab
+  3. T212 portfolio (pies) → Portfolio tab
 
 Usage: cd src && python fetch_and_sync.py
 """
@@ -69,20 +69,7 @@ def main() -> None:
     else:
         log.info("No alerts configured.")
 
-    # ── Step 3: Market scorecard → Signals tab ───────────────────────────
-    log.info("Fetching market scorecard...")
-    from market_data import get_market_scorecard
-    scorecard = get_market_scorecard()
-    sheet.write_market_overview(scorecard)
-    log.info("Market scorecard written (%d rows).", len(scorecard))
-
-    for entry in scorecard:
-        if entry.get("name") == "Market Health" and entry.get("signal") in ("Danger", "Stressed"):
-            msg = f"Market Health: {entry['value']}/100 ({entry['signal']})"
-            high_risk_items.append(msg)
-            telegram_notify.notify_high_risk("Market Health", msg)
-
-    # ── Step 4: Signal metrics → Signals tab ─────────────────────────────
+    # ── Step 3: Signal metrics → Signals tab ─────────────────────────────
     log.info("Computing signal metrics...")
     from market_data import get_signal_metrics
     signals = get_signal_metrics()
@@ -101,8 +88,8 @@ def main() -> None:
             except (ValueError, TypeError):
                 pass
 
-    # ── Step 5: Fetch T212 portfolio ─────────────────────────────────────
-    log.info("Fetching T212 portfolio...")
+    # ── Step 4: Fetch T212 portfolio (via pies) ──────────────────────────
+    log.info("Fetching T212 portfolio (pies)...")
     from fetch_portfolio import fetch_all_positions, t212_to_yfinance
     positions = fetch_all_positions()
     if not positions:
@@ -110,14 +97,13 @@ def main() -> None:
     else:
         log.info("%d positions fetched.", len(positions))
         for p in positions[:10]:
-            log.info("  %-10s qty=%.4f  avgPrice=%.2f  price=%.2f  P/L=%.2f",
-                     p["ticker"], p["quantity"],
-                     p["averagePrice"], p["currentPrice"],
-                     p["ppl"])
+            log.info("  [%s] %-15s qty=%.4f  value=£%.2f  P/L=£%.2f",
+                     p.get("pieName", "?")[:10], p["ticker"],
+                     p["quantity"], p["value"], p["ppl"])
         if len(positions) > 10:
             log.info("  ... and %d more", len(positions) - 10)
 
-        # Get live prices from yfinance (map T212 tickers to yfinance format)
+        # Get live prices from yfinance
         log.info("Fetching live prices from yfinance...")
         from market_data import get_batch_prices
         t212_tickers = [p["ticker"] for p in positions if p.get("ticker")]
@@ -136,7 +122,7 @@ def main() -> None:
         sheet.sync_portfolio(positions, prices=live_prices)
         log.info("Portfolio synced.")
 
-    # ── Step 6: Telegram summary if high-risk ────────────────────────────
+    # ── Step 5: Telegram summary if high-risk ────────────────────────────
     if high_risk_items:
         summary_lines = "\n".join(f"- {item}" for item in high_risk_items)
         telegram_notify.notify_high_risk(

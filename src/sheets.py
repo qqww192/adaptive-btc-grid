@@ -40,7 +40,7 @@ TAB_ALERTS = "Alerts"
 
 # Column headers
 PORTFOLIO_HEADERS = [
-    "Symbol", "Qty", "Avg Price", "Current Price", "P/L",
+    "Pie", "Symbol", "Name", "Qty", "Avg Price", "Current Price", "P/L",
     "Value", "Weight %",
     "Verdict", "Fair Value", "Risk", "Key Note", "Updated",
 ]
@@ -116,21 +116,21 @@ class SheetManager:
         self.url = f"https://docs.google.com/spreadsheets/d/{self.sheet_id}/edit"
 
     # ── Portfolio tab ──────────────────────────────────────────────────────────
-    # Columns: Symbol | Qty | Avg Price | Current Price | P/L | Value | Weight %
-    #          | Verdict | Fair Value | Risk | Key Note | Updated
+    # Columns: Pie | Symbol | Name | Qty | Avg Price | Current Price | P/L
+    #          | Value | Weight % | Verdict | Fair Value | Risk | Key Note | Updated
 
     def sync_portfolio(self, positions: list[dict[str, Any]], prices: dict[str, float] | None = None) -> None:
         """
         Sync T212 positions into the Portfolio tab.
-        Positions are already normalised by fetch_portfolio._normalise_position().
-        Uses walletImpact.currentValue for value (already in account currency).
+        Positions come from fetch_portfolio.fetch_portfolio() (pies endpoint).
         Preserves existing analysis fields (Verdict, Fair Value, Risk, Key Note).
         """
         existing = self._read_tab(TAB_PORTFOLIO)
+        # Key by symbol (col B, index 1)
         existing_by_symbol: dict[str, list] = {}
         for row in existing:
-            if len(row) >= 1 and row[0]:
-                existing_by_symbol[row[0]] = row
+            if len(row) >= 2 and row[1]:
+                existing_by_symbol[row[1]] = row
 
         prices = prices or {}
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -138,36 +138,38 @@ class SheetManager:
         total_value = 0
         pos_data = []
         for pos in positions:
-            ticker = pos.get("ticker", "UNKNOWN")
-            if not ticker or ticker == "UNKNOWN":
+            ticker = pos.get("ticker", "")
+            if not ticker:
                 continue
+            pie_name = pos.get("pieName", "")
+            name = pos.get("name", "")
             qty = float(pos.get("quantity", 0))
             avg_price = float(pos.get("averagePrice", 0))
-            # Use yfinance price if available, otherwise T212 price (already currency-normalised)
             current_price = prices.get(ticker) or float(pos.get("currentPrice", 0))
             ppl = float(pos.get("ppl", 0))
-            # Use walletImpact.currentValue if available (already in account currency)
             value = float(pos.get("value", 0)) or (qty * current_price)
             total_value += value
-            pos_data.append((ticker, qty, avg_price, current_price, ppl, value))
+            pos_data.append((pie_name, ticker, name, qty, avg_price, current_price, ppl, value))
 
         rows = []
-        for ticker, qty, avg_price, current_price, ppl, value in pos_data:
+        for pie_name, ticker, name, qty, avg_price, current_price, ppl, value in pos_data:
             weight = f"{value / total_value * 100:.1f}" if total_value else "0"
 
             old = existing_by_symbol.get(ticker, [])
-            verdict = old[7] if len(old) > 7 else ""
-            fair_val = old[8] if len(old) > 8 else ""
-            risk = old[9] if len(old) > 9 else ""
-            key_note = old[10] if len(old) > 10 else ""
+            # Analysis columns are at indices 9-12 in new layout
+            verdict = old[9] if len(old) > 9 else ""
+            fair_val = old[10] if len(old) > 10 else ""
+            risk = old[11] if len(old) > 11 else ""
+            key_note = old[12] if len(old) > 12 else ""
 
             rows.append([
-                ticker, qty, f"{avg_price:.2f}", f"{current_price:.2f}",
+                pie_name, ticker, name, qty,
+                f"{avg_price:.2f}", f"{current_price:.2f}",
                 f"{ppl:.2f}", f"{value:.2f}", weight,
                 verdict, fair_val, risk, key_note, now,
             ])
 
-        rows.sort(key=lambda r: float(r[6]) if r[6] else 0, reverse=True)
+        rows.sort(key=lambda r: float(r[8]) if r[8] else 0, reverse=True)
 
         all_rows = [PORTFOLIO_HEADERS] + rows
         self._write_tab(TAB_PORTFOLIO, all_rows)
@@ -178,34 +180,37 @@ class SheetManager:
         rows = self._read_tab(TAB_PORTFOLIO)
         stocks = []
         for row in rows:
-            if len(row) < 1 or not row[0]:
+            if len(row) < 2 or not row[1]:
                 continue
             stocks.append({
-                "symbol": row[0],
-                "qty": row[1] if len(row) > 1 else 0,
-                "avg_price": row[2] if len(row) > 2 else 0,
-                "price": row[3] if len(row) > 3 else 0,
-                "ppl": row[4] if len(row) > 4 else 0,
-                "value": row[5] if len(row) > 5 else 0,
-                "weight": row[6] if len(row) > 6 else "0",
+                "pie": row[0] if row else "",
+                "symbol": row[1],
+                "name": row[2] if len(row) > 2 else "",
+                "qty": row[3] if len(row) > 3 else 0,
+                "avg_price": row[4] if len(row) > 4 else 0,
+                "price": row[5] if len(row) > 5 else 0,
+                "ppl": row[6] if len(row) > 6 else 0,
+                "value": row[7] if len(row) > 7 else 0,
+                "weight": row[8] if len(row) > 8 else "0",
             })
         stocks.sort(key=lambda s: float(s.get("weight", 0)), reverse=True)
         return stocks
 
     def update_portfolio_analysis(self, symbol: str, verdict: str, fair_value: str,
                                    risk: str, key_note: str) -> None:
-        """Update the analysis columns for a portfolio stock."""
+        """Update the analysis columns for a portfolio stock (cols J-N)."""
         rows = self._read_tab(TAB_PORTFOLIO)
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         for i, row in enumerate(rows):
-            if len(row) >= 1 and row[0] == symbol:
-                while len(row) < 12:
+            # Symbol is column B (index 1)
+            if len(row) >= 2 and row[1] == symbol:
+                while len(row) < 14:
                     row.append("")
-                row[7] = verdict
-                row[8] = fair_value
-                row[9] = risk
-                row[10] = key_note
-                row[11] = now
+                row[9] = verdict
+                row[10] = fair_value
+                row[11] = risk
+                row[12] = key_note
+                row[13] = now
                 self.sheets.spreadsheets().values().update(
                     spreadsheetId=self.sheet_id,
                     range=f"'{TAB_PORTFOLIO}'!A{i + 2}",
@@ -262,9 +267,18 @@ class SheetManager:
         self._write_tab(TAB_SIGNALS, all_rows)
         log.info("Signals tab updated: %d %s entries.", len(new_rows), signal_type)
 
-    def write_market_overview(self, entries: list[dict]) -> None:
-        """Write market scorecard rows into the Signals tab as type 'Market'."""
-        self.write_signals(entries, signal_type="Market")
+    def write_signal_ai_summary(self, summary: str) -> None:
+        """Append an AI interpretation row to the Signals tab."""
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        row = [today, "AI", "Market Summary", "", "", summary, "", "", now]
+        self.sheets.spreadsheets().values().append(
+            spreadsheetId=self.sheet_id,
+            range=f"'{TAB_SIGNALS}'!A:I",
+            valueInputOption="RAW",
+            body={"values": [row]},
+        ).execute()
+        log.info("AI signal summary appended.")
 
     # ── Alerts tab ─────────────────────────────────────────────────────────────
     # Columns: Symbol | Metric | Condition | Threshold | Type

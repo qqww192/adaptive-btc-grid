@@ -3,8 +3,8 @@ T212 Portfolio Checker — Daily Orchestrator
 
 Pipeline priority:
   1. Evaluate alerts first → Telegram if triggered
-  2. Get market data and update Signals tab
-  3. Update portfolio from T212
+  2. Compute signal metrics → Signals tab + AI summary
+  3. Update portfolio from T212 (via pies endpoint)
   4. AI analysis on portfolio; if risk is high → Telegram
   5. If alerts, signals, or AI show high risk → Telegram summary
 """
@@ -18,10 +18,8 @@ from fetch_portfolio import fetch_all_positions, t212_to_yfinance
 from sheets import SheetManager
 from market_data import (
     get_batch_prices,
-    get_market_scorecard,
     get_signal_metrics,
     build_stock_context,
-    build_market_summary,
     evaluate_alert,
 )
 from analyse import (
@@ -89,32 +87,21 @@ def main() -> None:
     else:
         log.info("  No alerts configured.")
 
-    # ── Step 2: Market scorecard + Signal metrics → Signals tab ────────────
-    log.info("Step 2 — Building market scorecard...")
-    market_summary = ""
-    try:
-        scorecard = get_market_scorecard()
-        sheet.write_market_overview(scorecard)
-        market_summary = build_market_summary(scorecard)
-        log.info("  Market scorecard written (%d indicators).", len(scorecard))
-
-        # Check for danger signals in scorecard
-        for entry in scorecard:
-            if entry.get("name") == "Market Health" and entry.get("signal") in ("Danger", "Stressed"):
-                msg = f"Market Health: {entry['value']}/100 ({entry['signal']})"
-                high_risk_items.append(msg)
-                telegram_notify.notify_high_risk("Market Health", msg)
-    except Exception as e:
-        log.error("  Market scorecard failed: %s", e)
-        scorecard = []
-
-    log.info("Step 2b — Computing signal metrics...")
+    # ── Step 2: Signal metrics → Signals tab ──────────────────────────────
+    log.info("Step 2 — Computing signal metrics...")
+    signals_summary = ""
     try:
         signals = get_signal_metrics()
         sheet.write_signals(signals, signal_type="Signal")
         log.info("  %d signals computed.", len(signals))
         for s in signals:
             log.info("    %-25s %10s  [%s]", s["name"], s["value"], s["signal"])
+
+        # Build summary for AI
+        signal_lines = []
+        for s in signals:
+            signal_lines.append(f"{s['name']}: {s['value']} [{s['signal']}] ({s.get('reading', '')})")
+        signals_summary = "\n".join(signal_lines)
 
         # Check Fear & Greed for extreme fear
         for s in signals:
@@ -130,8 +117,20 @@ def main() -> None:
     except Exception as e:
         log.error("  Signal metrics failed: %s", e)
 
-    # ── Step 3: Fetch & sync portfolio ─────────────────────────────────────
-    log.info("Step 3 — Fetching portfolio from Trading 212...")
+    # 2b: AI interpretation of signals
+    if not budget.exhausted and signals_summary:
+        log.info("Step 2b — AI signal interpretation...")
+        if budget.consume():
+            try:
+                positions_for_ai = []  # will be filled in step 3
+                ai_summary = analyse_market_overview(gemini, signals_summary, positions_for_ai)
+                sheet.write_signal_ai_summary(ai_summary)
+                log.info("  AI signals summary: %s", ai_summary[:120])
+            except Exception as e:
+                log.error("  AI signal interpretation failed: %s", e)
+
+    # ── Step 3: Fetch & sync portfolio from T212 pies ─────────────────────
+    log.info("Step 3 — Fetching portfolio from Trading 212 (pies)...")
     positions = fetch_all_positions()
     if not positions:
         log.warning("No positions returned. Continuing with existing sheet data.")
@@ -149,21 +148,9 @@ def main() -> None:
         log.info("  Live prices fetched for %d/%d symbols.", len(live_prices), len(t212_tickers))
         sheet.sync_portfolio(positions, prices=live_prices)
 
-    # ── Step 4: AI analysis (structured) ───────────────────────────────────
-    # 4a: AI market interpretation (1 Gemini request)
-    if not budget.exhausted and market_summary:
-        log.info("Step 4a — AI market interpretation...")
-        if budget.consume():
-            try:
-                market_positions = positions or []
-                ai_summary = analyse_market_overview(gemini, market_summary, market_positions)
-                log.info("  AI summary: %s", ai_summary[:100])
-            except Exception as e:
-                log.error("  Market AI interpretation failed: %s", e)
-
-    # 4b: AI stock analysis
+    # ── Step 4: AI stock analysis ─────────────────────────────────────────
     if not budget.exhausted:
-        log.info("Step 4b — Analysing stocks (budget: %d remaining)...", budget.remaining)
+        log.info("Step 4 — Analysing stocks (budget: %d remaining)...", budget.remaining)
         stocks = sheet.get_portfolio_for_analysis()
         analysed = 0
         for stock in stocks:
@@ -184,7 +171,7 @@ def main() -> None:
                     amount=stock.get("qty", 0),
                     price=stock.get("price", 0),
                     weight=stock.get("weight", "0"),
-                    market_context=market_summary,
+                    market_context=signals_summary,
                 )
                 sheet.update_portfolio_analysis(
                     symbol,
@@ -212,7 +199,7 @@ def main() -> None:
             except Exception as e:
                 log.error("  Failed to analyse %s: %s", symbol, e)
     else:
-        log.info("Step 4b — Skipped (budget exhausted).")
+        log.info("Step 4 — Skipped (budget exhausted).")
 
     # ── Step 5: Final Telegram summary if any high-risk items ──────────────
     if high_risk_items:
