@@ -122,7 +122,8 @@ class SheetManager:
     def sync_portfolio(self, positions: list[dict[str, Any]], prices: dict[str, float] | None = None) -> None:
         """
         Sync T212 positions into the Portfolio tab.
-        Uses actual T212 API fields: ticker, quantity, averagePrice, currentPrice, ppl.
+        Positions are already normalised by fetch_portfolio._normalise_position().
+        Uses walletImpact.currentValue for value (already in account currency).
         Preserves existing analysis fields (Verdict, Fair Value, Risk, Key Note).
         """
         existing = self._read_tab(TAB_PORTFOLIO)
@@ -137,12 +138,16 @@ class SheetManager:
         total_value = 0
         pos_data = []
         for pos in positions:
-            ticker = pos.get("ticker", "N/A")
+            ticker = pos.get("ticker", "UNKNOWN")
+            if not ticker or ticker == "UNKNOWN":
+                continue
             qty = float(pos.get("quantity", 0))
             avg_price = float(pos.get("averagePrice", 0))
+            # Use yfinance price if available, otherwise T212 price (already currency-normalised)
             current_price = prices.get(ticker) or float(pos.get("currentPrice", 0))
             ppl = float(pos.get("ppl", 0))
-            value = qty * current_price
+            # Use walletImpact.currentValue if available (already in account currency)
+            value = float(pos.get("value", 0)) or (qty * current_price)
             total_value += value
             pos_data.append((ticker, qty, avg_price, current_price, ppl, value))
 
@@ -157,8 +162,8 @@ class SheetManager:
             key_note = old[10] if len(old) > 10 else ""
 
             rows.append([
-                ticker, qty, avg_price, current_price,
-                round(ppl, 2), round(value, 2), weight,
+                ticker, qty, f"{avg_price:.2f}", f"{current_price:.2f}",
+                f"{ppl:.2f}", f"{value:.2f}", weight,
                 verdict, fair_val, risk, key_note, now,
             ])
 
@@ -166,7 +171,7 @@ class SheetManager:
 
         all_rows = [PORTFOLIO_HEADERS] + rows
         self._write_tab(TAB_PORTFOLIO, all_rows)
-        log.info("Portfolio tab synced with %d positions.", len(rows))
+        log.info("Portfolio tab synced with %d positions. Total: £%.2f", len(rows), total_value)
 
     def get_portfolio_for_analysis(self) -> list[dict]:
         """Returns portfolio stocks sorted by weight (highest first)."""
