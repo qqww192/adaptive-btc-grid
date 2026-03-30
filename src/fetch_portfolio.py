@@ -14,6 +14,7 @@ Each instrument in a pie has:
 Auth: Basic Auth (API_KEY:SECRET_KEY base64-encoded) or legacy API key header.
 """
 
+import base64
 import json
 import os
 import logging
@@ -31,15 +32,20 @@ MINOR_CURRENCY_CODES = {"GBX", "GBp", "ILA"}
 
 
 def _get_headers() -> dict[str, str]:
-    """Build auth headers for T212 API."""
+    """Build auth headers for T212 API (Basic Auth)."""
     api_key = os.environ.get("T212_API_KEY", "")
+    secret_key = os.environ.get("T212_SECRET_KEY", "")
     if not api_key:
         raise EnvironmentError(
             "T212_API_KEY environment variable is not set. "
             "See docs/setup.md for how to obtain and configure it."
         )
-    # T212 API uses the API key directly in the Authorization header
-    return {"Authorization": api_key}
+    if secret_key:
+        credentials = base64.b64encode(f"{api_key}:{secret_key}".encode()).decode()
+        return {"Authorization": f"Basic {credentials}"}
+    else:
+        # Fallback: pass API key directly
+        return {"Authorization": api_key}
 
 
 def _get(client: httpx.Client, path: str) -> Any:
