@@ -6,7 +6,6 @@ Test Case 1 (Daily):  Gemini news scan → Telegram alert
 Test Case 2 (Weekly): T212 fetch → Gemini analysis → Google Drive report → Telegram snapshot
 """
 
-import base64
 import os
 import sys
 import json
@@ -25,20 +24,29 @@ TIMEOUT = 15
 # ── Individual service tests ─────────────────────────────────────────────────
 
 def test_t212_connection() -> bool:
-    """Test Trading 212 API connectivity and fetch positions."""
+    """Test Trading 212 API connectivity via pies endpoint."""
     api_key = os.environ.get("T212_API_KEY", "")
-    secret_key = os.environ.get("T212_SECRET_KEY", "")
-    if not api_key or not secret_key:
-        log.error("  FAIL — T212_API_KEY or T212_SECRET_KEY not set.")
+    if not api_key:
+        log.error("  FAIL — T212_API_KEY not set.")
         return False
 
-    credentials = base64.b64encode(f"{api_key}:{secret_key}".encode()).decode()
-    headers = {"Authorization": f"Basic {credentials}"}
+    # T212 API uses the API key directly in the Authorization header
+    headers = {"Authorization": api_key}
+    log.info("  Using API key header.")
+
     try:
-        resp = httpx.get(f"{T212_BASE}/equity/positions", headers=headers, timeout=TIMEOUT)
+        resp = httpx.get(f"{T212_BASE}/equity/pies", headers=headers, timeout=TIMEOUT)
+        log.info("  Response status: %d", resp.status_code)
+        log.info("  Response body: %s", resp.text[:500])
         resp.raise_for_status()
-        positions = resp.json()
-        log.info(f"  PASS — Trading 212 connected. {len(positions)} positions found.")
+        pies = resp.json()
+        if isinstance(pies, list):
+            log.info(f"  PASS — Trading 212 connected. {len(pies)} pies found.")
+            for p in pies:
+                log.info("    Pie ID: %s", p.get("id", "?"))
+        else:
+            log.info(f"  PASS — Trading 212 connected. Response type: {type(pies).__name__}")
+            log.info("    Raw: %s", json.dumps(pies, default=str)[:300])
         return True
     except httpx.HTTPStatusError as e:
         log.error(f"  FAIL — Trading 212 returned {e.response.status_code}: {e.response.text}")

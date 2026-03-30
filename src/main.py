@@ -1,32 +1,34 @@
 """
-T212 Portfolio Checker — Daily Orchestrator
+T212 Portfolio Checker — Unified Pipeline
 
-Pipeline priority:
-  1. Evaluate alerts first → Telegram if triggered
-  2. Compute signal metrics → Signals tab + AI summary
-  3. Update portfolio from T212 (via pies endpoint)
-  4. AI analysis on portfolio; if risk is high → Telegram
-  5. If alerts, signals, or AI show high risk → Telegram summary
+Runs both daily (cron) and manual triggers from a single script.
+Use --no-ai to skip Gemini analysis (saves API quota).
+
+Pipeline:
+  1. Evaluate alerts → Telegram if triggered
+  2. Compute signal metrics → Signals tab (+ AI summary if enabled)
+  3. Fetch portfolio from T212 (all pies) → Portfolio tab
+  4. AI stock analysis (if enabled) → checkbox + stalest first, max 15
+  5. Final Telegram summary if any high-risk items
+
+Usage:
+  python main.py            # full pipeline with AI
+  python main.py --no-ai    # data only, no Gemini calls
 """
 
+import argparse
 import os
 import sys
 import logging
 from dotenv import load_dotenv
 
-from fetch_portfolio import fetch_all_positions, t212_to_yfinance
+from fetch_portfolio import fetch_portfolio, t212_to_yfinance
 from sheets import SheetManager
 from market_data import (
     get_batch_prices,
     get_signal_metrics,
     build_stock_context,
     evaluate_alert,
-)
-from analyse import (
-    _get_client,
-    AnalysisBudget,
-    analyse_market_overview,
-    analyse_stock,
 )
 import telegram_notify
 
@@ -41,16 +43,31 @@ HIGH_RISK_THRESHOLD = 7  # risk score >= this triggers Telegram
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="T212 Portfolio Checker")
+    parser.add_argument(
+        "--no-ai", action="store_true",
+        help="Skip Gemini AI analysis (data sync only)",
+    )
+    args = parser.parse_args()
+    use_ai = not args.no_ai
+
     load_dotenv()
 
-    log.info("=== T212 Portfolio Checker starting ===")
+    mode = "Full pipeline" if use_ai else "Data sync (no AI)"
+    log.info("=== T212 Portfolio Checker — %s ===", mode)
 
-    gemini = _get_client()
-    budget = AnalysisBudget()
     sheet = SheetManager()
-    log.info("Sheet URL: %s", sheet.url)
+    log.info("Sheet: %s", sheet.url)
 
     high_risk_items: list[str] = []
+
+    # AI setup (only if needed)
+    gemini = None
+    budget = None
+    if use_ai:
+        from analyse import _get_client, AnalysisBudget
+        gemini = _get_client()
+        budget = AnalysisBudget()
 
     # ── Step 1: Evaluate alerts ────────────────────────────────────────────
     log.info("Step 1 — Evaluating alerts...")
@@ -118,12 +135,12 @@ def main() -> None:
         log.error("  Signal metrics failed: %s", e)
 
     # 2b: AI interpretation of signals + Telegram if risk detected
-    if not budget.exhausted and signals_summary:
+    if use_ai and not budget.exhausted and signals_summary:
         log.info("Step 2b — AI signal interpretation...")
+        from analyse import analyse_market_overview
         if budget.consume():
             try:
-                positions_for_ai = []  # will be filled in step 3
-                ai_summary = analyse_market_overview(gemini, signals_summary, positions_for_ai)
+                ai_summary = analyse_market_overview(gemini, signals_summary, [])
                 sheet.write_signal_ai_summary(ai_summary)
                 log.info("  AI signals summary: %s", ai_summary[:120])
                 # Check if AI summary mentions high risk / bearish sentiment
@@ -140,14 +157,23 @@ def main() -> None:
 
     # ── Step 3: Fetch & sync portfolio from T212 pies ─────────────────────
     log.info("Step 3 — Fetching portfolio from Trading 212 (pies)...")
-    positions = fetch_all_positions()
+    positions = fetch_portfolio()
     if not positions:
-        log.warning("No positions returned. Continuing with existing sheet data.")
+        log.warning("  No positions returned. Check T212_API_KEY is correct.")
+        log.warning("  Continuing with existing sheet data.")
     else:
-        log.info("  %d positions fetched. Getting live prices...", len(positions))
+        log.info("  %d positions fetched across pies. Getting live prices...", len(positions))
+        for p in positions[:10]:
+            log.info("    [%s] %-15s qty=%.4f  value=£%.2f  P/L=£%.2f",
+                     p.get("pieName", "?")[:12], p["ticker"],
+                     p["quantity"], p["value"], p["ppl"])
+        if len(positions) > 10:
+            log.info("    ... and %d more", len(positions) - 10)
+
         # Map T212 tickers to yfinance format for price lookup
         t212_tickers = [p["ticker"] for p in positions if p.get("ticker")]
         yf_tickers = [t212_to_yfinance(t) for t in t212_tickers]
+        log.info("  Ticker mapping: %s", dict(list(zip(t212_tickers, yf_tickers))[:5]))
         yf_prices = get_batch_prices(yf_tickers)
         # Map prices back to T212 ticker keys
         live_prices = {}
@@ -157,9 +183,10 @@ def main() -> None:
         log.info("  Live prices fetched for %d/%d symbols.", len(live_prices), len(t212_tickers))
         sheet.sync_portfolio(positions, prices=live_prices)
 
-    # ── Step 4: AI stock analysis (checkbox + stalest first, max 15) ────────
-    if not budget.exhausted:
+    # ── Step 4: AI stock analysis (checkbox + stalest first, max 15) ──────
+    if use_ai and not budget.exhausted:
         log.info("Step 4 — Analysing stocks (budget: %d remaining)...", budget.remaining)
+        from analyse import analyse_stock
         stocks = sheet.get_portfolio_for_analysis(max_tickers=15)
         if not stocks:
             log.info("  No stocks have AI Analyse checked. Skipping.")
@@ -213,8 +240,10 @@ def main() -> None:
                     pass
             except Exception as e:
                 log.error("  Failed to analyse %s: %s", symbol, e)
-    else:
+    elif use_ai:
         log.info("Step 4 — Skipped (budget exhausted).")
+    else:
+        log.info("Step 4 — Skipped (--no-ai mode).")
 
     # ── Step 5: Final Telegram summary if any high-risk items ──────────────
     if high_risk_items:
@@ -228,10 +257,13 @@ def main() -> None:
         log.info("Step 5 — No high-risk items. No Telegram summary needed.")
 
     # ── Summary ────────────────────────────────────────────────────────────
-    log.info(
-        "=== Done — %d/%d Gemini requests used ===",
-        budget.used, budget.max_requests,
-    )
+    if use_ai:
+        log.info(
+            "=== Done — %d/%d Gemini requests used ===",
+            budget.used, budget.max_requests,
+        )
+    else:
+        log.info("=== Done — no AI requests used (--no-ai mode) ===")
     log.info("Sheet: %s", sheet.url)
 
 

@@ -14,7 +14,6 @@ Each instrument in a pie has:
 Auth: Basic Auth (API_KEY:SECRET_KEY base64-encoded) or legacy API key header.
 """
 
-import base64
 import json
 import os
 import logging
@@ -32,19 +31,15 @@ MINOR_CURRENCY_CODES = {"GBX", "GBp", "ILA"}
 
 
 def _get_headers() -> dict[str, str]:
-    """Build auth headers. Supports Basic Auth (key+secret) or legacy API key."""
+    """Build auth headers for T212 API."""
     api_key = os.environ.get("T212_API_KEY", "")
-    secret_key = os.environ.get("T212_SECRET_KEY", "")
     if not api_key:
         raise EnvironmentError(
             "T212_API_KEY environment variable is not set. "
             "See docs/setup.md for how to obtain and configure it."
         )
-    if secret_key:
-        credentials = base64.b64encode(f"{api_key}:{secret_key}".encode()).decode()
-        return {"Authorization": f"Basic {credentials}"}
-    else:
-        return {"Authorization": api_key}
+    # T212 API uses the API key directly in the Authorization header
+    return {"Authorization": api_key}
 
 
 def _get(client: httpx.Client, path: str) -> Any:
@@ -188,10 +183,6 @@ def fetch_portfolio() -> list[dict[str, Any]]:
                  p["quantity"], p["value"], weight)
 
     return all_positions
-
-
-# Keep old name as alias for backward compatibility in pipeline files
-fetch_all_positions = fetch_portfolio
 
 
 def t212_to_yfinance(t212_ticker: str) -> str:
