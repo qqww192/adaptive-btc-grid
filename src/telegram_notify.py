@@ -13,20 +13,20 @@ import urllib.error
 
 log = logging.getLogger(__name__)
 
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 API_URL = "https://api.telegram.org/bot{token}/sendMessage"
 
 
 def send_message(text: str, parse_mode: str = "HTML") -> bool:
     """Send a message via Telegram. Returns True on success."""
-    if not BOT_TOKEN or not CHAT_ID:
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+    if not bot_token or not chat_id:
         log.warning("Telegram not configured (missing BOT_TOKEN or CHAT_ID). Skipping.")
         return False
 
-    url = API_URL.format(token=BOT_TOKEN)
+    url = API_URL.format(token=bot_token)
     payload = json.dumps({
-        "chat_id": CHAT_ID,
+        "chat_id": chat_id,
         "text": text[:4090],
         "parse_mode": parse_mode,
         "disable_web_page_preview": True,
