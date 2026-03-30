@@ -26,6 +26,7 @@ from fetch_portfolio import fetch_portfolio, t212_to_yfinance
 from sheets import SheetManager
 from market_data import (
     get_batch_info,
+    get_market_scorecard,
     get_signal_metrics,
     build_stock_context,
     evaluate_alert,
@@ -104,9 +105,27 @@ def main() -> None:
     else:
         log.info("  No alerts configured.")
 
-    # ── Step 2: Signal metrics → Signals tab ──────────────────────────────
-    log.info("Step 2 — Computing signal metrics...")
+    # ── Step 2: Market overview + Signal metrics → Signals tab ─────────────
+    log.info("Step 2 — Computing market overview + signal metrics...")
     signals_summary = ""
+
+    # 2a: Market overview (indices, VIX, yields, commodities)
+    try:
+        scorecard = get_market_scorecard()
+        sheet.write_signals(scorecard, signal_type="Market")
+        log.info("  %d market indicators fetched.", len(scorecard))
+        for s in scorecard:
+            val = s["value"]
+            chg = s.get("change_pct", "")
+            if isinstance(val, (int, float)) and isinstance(chg, (int, float)):
+                log.info("    %-15s %10.2f  %+.2f%%  [%s]", s["name"], val, chg, s["signal"])
+            else:
+                log.info("    %-15s %10s         [%s]", s["name"], val, s["signal"])
+    except Exception as e:
+        log.error("  Market overview failed: %s", e)
+        scorecard = []
+
+    # 2b: High-reliability signal metrics
     try:
         signals = get_signal_metrics()
         sheet.write_signals(signals, signal_type="Signal")
@@ -114,11 +133,18 @@ def main() -> None:
         for s in signals:
             log.info("    %-25s %10s  [%s]", s["name"], s["value"], s["signal"])
 
-        # Build summary for AI
-        signal_lines = []
+        # Build combined summary for AI (market + signals)
+        summary_lines = []
+        for s in scorecard:
+            val = s["value"]
+            chg = s.get("change_pct", "")
+            if isinstance(chg, (int, float)):
+                summary_lines.append(f"{s['name']}: {val} ({chg:+.2f}%) [{s['signal']}]")
+            else:
+                summary_lines.append(f"{s['name']}: {val} [{s['signal']}]")
         for s in signals:
-            signal_lines.append(f"{s['name']}: {s['value']} [{s['signal']}] ({s.get('reading', '')})")
-        signals_summary = "\n".join(signal_lines)
+            summary_lines.append(f"{s['name']}: {s['value']} [{s['signal']}] ({s.get('reading', '')})")
+        signals_summary = "\n".join(summary_lines)
 
         # Check Fear & Greed for extreme fear
         for s in signals:
@@ -134,26 +160,26 @@ def main() -> None:
     except Exception as e:
         log.error("  Signal metrics failed: %s", e)
 
-    # 2b: AI interpretation of signals + Telegram if risk detected
+    # 2c: AI Summary (based on market overview + signals) → Telegram if risky
     if use_ai and not budget.exhausted and signals_summary:
-        log.info("Step 2b — AI signal interpretation...")
+        log.info("Step 2c — AI Summary of market + signals...")
         from analyse import analyse_market_overview
         if budget.consume():
             try:
                 ai_summary = analyse_market_overview(gemini, signals_summary, [])
                 sheet.write_signal_ai_summary(ai_summary)
-                log.info("  AI signals summary: %s", ai_summary[:120])
+                log.info("  AI Summary: %s", ai_summary[:120])
                 # Check if AI summary mentions high risk / bearish sentiment
                 risk_keywords = ["high risk", "bearish", "sell-off", "crash", "correction",
                                  "recession", "extreme fear", "danger", "caution"]
                 summary_lower = ai_summary.lower()
                 if any(kw in summary_lower for kw in risk_keywords):
                     telegram_notify.notify_high_risk(
-                        "AI Signal Summary", ai_summary,
+                        "AI Summary", ai_summary,
                     )
-                    high_risk_items.append(f"AI Signals: {ai_summary[:100]}")
+                    high_risk_items.append(f"AI Summary: {ai_summary[:100]}")
             except Exception as e:
-                log.error("  AI signal interpretation failed: %s", e)
+                log.error("  AI Summary failed: %s", e)
 
     # ── Step 3: Fetch & sync portfolio from T212 pies ─────────────────────
     log.info("Step 3 — Fetching portfolio from Trading 212 (pies)...")

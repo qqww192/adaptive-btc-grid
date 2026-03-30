@@ -182,7 +182,45 @@ class SheetManager:
 
         all_rows = [PORTFOLIO_HEADERS] + rows
         self._write_tab(TAB_PORTFOLIO, all_rows)
+        self._set_portfolio_checkboxes(len(rows))
         log.info("Portfolio tab synced with %d positions. Total: £%.2f", len(rows), total_value)
+
+    def _set_portfolio_checkboxes(self, num_rows: int) -> None:
+        """Apply checkbox data validation to AI Analyse column (J) for all data rows."""
+        if num_rows <= 0:
+            return
+        try:
+            # Get the Portfolio tab's sheet ID (not the spreadsheet ID)
+            spreadsheet = self.sheets.spreadsheets().get(spreadsheetId=self.sheet_id).execute()
+            tab_sheet_id = None
+            for s in spreadsheet["sheets"]:
+                if s["properties"]["title"] == TAB_PORTFOLIO:
+                    tab_sheet_id = s["properties"]["sheetId"]
+                    break
+            if tab_sheet_id is None:
+                return
+
+            request = {
+                "setDataValidation": {
+                    "range": {
+                        "sheetId": tab_sheet_id,
+                        "startRowIndex": 1,  # skip header
+                        "endRowIndex": 1 + num_rows,
+                        "startColumnIndex": 9,  # column J
+                        "endColumnIndex": 10,
+                    },
+                    "rule": {
+                        "condition": {"type": "BOOLEAN"},
+                        "showCustomUi": True,
+                    },
+                }
+            }
+            self.sheets.spreadsheets().batchUpdate(
+                spreadsheetId=self.sheet_id,
+                body={"requests": [request]},
+            ).execute()
+        except Exception as e:
+            log.warning("Failed to set checkboxes: %s", e)
 
     def get_portfolio_for_analysis(self, max_tickers: int = 15) -> list[dict]:
         """
@@ -289,17 +327,17 @@ class SheetManager:
         log.info("Signals tab updated: %d %s entries.", len(new_rows), signal_type)
 
     def write_signal_ai_summary(self, summary: str) -> None:
-        """Append an AI interpretation row to the Signals tab."""
+        """Write AI Summary row to Signals tab, replacing today's existing entry."""
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        row = [today, "AI", "Market Summary", "", "", summary, "", "", now]
-        self.sheets.spreadsheets().values().append(
-            spreadsheetId=self.sheet_id,
-            range=f"'{TAB_SIGNALS}'!A:I",
-            valueInputOption="RAW",
-            body={"values": [row]},
-        ).execute()
-        log.info("AI signal summary appended.")
+        existing = self._read_tab(TAB_SIGNALS)
+        # Remove any existing AI Summary for today
+        kept = [r for r in existing
+                if not (len(r) >= 2 and r[0] == today and r[1] == "AI Summary")]
+        new_row = [today, "AI Summary", "Market Summary", "", "", summary, "", "", now]
+        all_rows = [SIGNAL_HEADERS] + kept + [new_row]
+        self._write_tab(TAB_SIGNALS, all_rows)
+        log.info("AI Summary written to Signals tab.")
 
     # ── Alerts tab ─────────────────────────────────────────────────────────────
     # Columns: Symbol | Metric | Condition | Threshold | Type
