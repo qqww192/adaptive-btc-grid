@@ -92,23 +92,32 @@ def fetch_pie_detail(pie_id: int) -> dict[str, Any]:
               currentShare, result: {value, investedValue, result, resultCoef}, ...}],
               cash, dividendDetails, progress}
     """
-    try:
-        with httpx.Client(timeout=TIMEOUT) as client:
-            detail = _get(client, f"/equity/pies/{pie_id}")
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        try:
+            with httpx.Client(timeout=TIMEOUT) as client:
+                detail = _get(client, f"/equity/pies/{pie_id}")
 
-        log.info("Fetched pie %d: %s (%d instruments)",
-                 pie_id,
-                 detail.get("settings", {}).get("name", "?"),
-                 len(detail.get("instruments", [])))
-        return detail
+            log.info("Fetched pie %d: %s (%d instruments)",
+                     pie_id,
+                     detail.get("settings", {}).get("name", "?"),
+                     len(detail.get("instruments", [])))
+            return detail
 
-    except httpx.HTTPStatusError as e:
-        log.error("T212 pie detail API error for %d: %s — %s",
-                  pie_id, e.response.status_code, e.response.text)
-        return {}
-    except httpx.RequestError as e:
-        log.error("Network error fetching pie %d: %s", pie_id, e)
-        return {}
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 429 and attempt < max_retries:
+                wait = 5 * attempt
+                log.warning("Rate-limited on pie %d (attempt %d/%d). Waiting %ds...",
+                            pie_id, attempt, max_retries, wait)
+                time.sleep(wait)
+            else:
+                log.error("T212 pie detail API error for %d: %s — %s",
+                          pie_id, e.response.status_code, e.response.text)
+                return {}
+        except httpx.RequestError as e:
+            log.error("Network error fetching pie %d: %s", pie_id, e)
+            return {}
+    return {}
 
 
 def fetch_portfolio() -> list[dict[str, Any]]:
@@ -132,7 +141,7 @@ def fetch_portfolio() -> list[dict[str, Any]]:
 
         # T212 API rate limit: wait between requests
         if i > 0:
-            time.sleep(1.5)
+            time.sleep(5)
 
         detail = fetch_pie_detail(pie_id)
         if not detail:
