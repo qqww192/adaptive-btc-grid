@@ -83,21 +83,32 @@ def get_stock_info(symbol: str) -> dict[str, Any]:
 
 def get_batch_prices(symbols: list[str]) -> dict[str, float]:
     """Fetch current prices for multiple tickers in one call."""
+    result = get_batch_info(symbols)
+    return {sym: info["price"] for sym, info in result.items()}
+
+
+def get_batch_info(symbols: list[str]) -> dict[str, dict]:
+    """Fetch current prices and names for multiple tickers in one call.
+    Returns: {symbol: {"price": float, "name": str}}
+    """
     if not symbols:
         return {}
     try:
         tickers = yf.Tickers(" ".join(symbols))
-        prices = {}
+        result = {}
         for sym in symbols:
             try:
                 info = tickers.tickers[sym].info
-                prices[sym] = info.get("currentPrice") or info.get("regularMarketPrice", 0)
+                result[sym] = {
+                    "price": info.get("currentPrice") or info.get("regularMarketPrice", 0),
+                    "name": info.get("shortName") or info.get("longName", ""),
+                }
             except Exception:
-                prices[sym] = 0
-        return prices
+                result[sym] = {"price": 0, "name": ""}
+        return result
     except Exception as e:
-        log.warning("Batch price fetch failed: %s", e)
-        return {s: 0 for s in symbols}
+        log.warning("Batch info fetch failed: %s", e)
+        return {s: {"price": 0, "name": ""} for s in symbols}
 
 
 # ── Market scorecard ──────────────────────────────────────────────────────────
