@@ -8,6 +8,7 @@ Pipeline:
   1. Evaluate alerts → Telegram if triggered
   2. Compute signal metrics → Signals tab (+ AI summary if enabled)
   3. Fetch portfolio from T212 (all pies) → Portfolio tab
+  3.5. Stock scanner → Scanner Results tab (if conditions configured)
   4. AI stock analysis (if enabled) → checkbox + stalest first, max 15
   5. Final Telegram summary if any high-risk items
 
@@ -214,6 +215,28 @@ def main() -> None:
                         p["name"] = info["name"]
         log.info("  Live prices fetched for %d/%d symbols.", len(live_prices), len(t212_tickers))
         sheet.sync_portfolio(positions, prices=live_prices)
+
+    # ── Step 3.5: Stock Scanner ─────────────────────────────────────────────
+    log.info("Step 3.5 — Running stock scanner...")
+    try:
+        from scanner import resolve_universe, run_scan
+        scanner_conditions, universe_str = sheet.get_scanner_conditions()
+        if scanner_conditions:
+            universe = resolve_universe(universe_str)
+            log.info("  %d conditions, universe: %s (%d tickers)",
+                     len(scanner_conditions), universe_str or "US_MEGA50 (default)", len(universe))
+            matches = run_scan(scanner_conditions, universe)
+            sheet.write_scanner_results(matches)
+            sheet.update_scanner_status(len(matches))
+            if matches:
+                telegram_notify.notify_scanner_matches(matches, len(matches))
+                log.info("  %d matches written to Scanner Results.", len(matches))
+            else:
+                log.info("  No matches found.")
+        else:
+            log.info("  No scanner conditions configured. Skipping.")
+    except Exception as e:
+        log.error("  Scanner failed: %s", e)
 
     # ── Step 4: AI stock analysis (checkbox + stalest first, max 15) ──────
     if use_ai and not budget.exhausted:

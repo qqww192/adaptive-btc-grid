@@ -82,3 +82,25 @@ def notify_portfolio_risk(symbol: str, risk: str, verdict: str, key_note: str) -
         f"Note: {key_note}"
     )
     send_message(text)
+
+
+def notify_scanner_matches(matches: list[dict], total: int) -> None:
+    """Send a Telegram summary of top scanner matches."""
+    if not matches:
+        return
+    lines = [f"<b>SCANNER: {total} match(es) found</b>\n"]
+    for m in matches[:5]:
+        sym = m.get("symbol", "?")
+        name = m.get("name", "")
+        price = m.get("price", "")
+        pe = m.get("pe", "")
+        score = m.get("score", "")
+        line = f"<b>{sym}</b> {name[:25]}\n  Price: {price}"
+        if pe:
+            line += f" | P/E: {pe}"
+        if score:
+            line += f" | Score: {score}"
+        lines.append(line)
+    if total > 5:
+        lines.append(f"\n<i>...and {total - 5} more. See Scanner Results tab.</i>")
+    send_message("\n".join(lines))

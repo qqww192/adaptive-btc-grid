@@ -20,6 +20,9 @@ log = logging.getLogger(__name__)
 
 MODEL = "gemini-2.5-flash"
 MAX_DAILY_REQUESTS = 19
+RPM_LIMIT = 5
+_MIN_INTERVAL = 60.0 / RPM_LIMIT  # 12 seconds between calls
+_last_call_time: float = 0.0
 
 
 def _get_client() -> genai.Client:
@@ -33,7 +36,16 @@ def _get_client() -> genai.Client:
 
 
 def _call_gemini(client: genai.Client, prompt: str) -> str:
-    """Call Gemini with retry on 429."""
+    """Call Gemini with RPM throttling and retry on 429."""
+    global _last_call_time
+    now = time.time()
+    elapsed = now - _last_call_time
+    if elapsed < _MIN_INTERVAL:
+        wait = _MIN_INTERVAL - elapsed
+        log.info("RPM throttle: waiting %.1fs before next Gemini call.", wait)
+        time.sleep(wait)
+    _last_call_time = time.time()
+
     max_retries = 3
     for attempt in range(1, max_retries + 1):
         try:

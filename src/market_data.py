@@ -81,12 +81,6 @@ def get_stock_info(symbol: str) -> dict[str, Any]:
         return {"symbol": symbol, "price": 0}
 
 
-def get_batch_prices(symbols: list[str]) -> dict[str, float]:
-    """Fetch current prices for multiple tickers in one call."""
-    result = get_batch_info(symbols)
-    return {sym: info["price"] for sym, info in result.items()}
-
-
 def get_batch_info(symbols: list[str]) -> dict[str, dict]:
     """Fetch current prices and names for multiple tickers in one call.
     Returns: {symbol: {"price": float, "name": str}}
@@ -714,17 +708,3 @@ def build_stock_context(symbol: str) -> str:
     return " | ".join(parts)
 
 
-def build_market_summary(scorecard: list[dict]) -> str:
-    """Build a concise market context string from the scorecard for AI prompt."""
-    lines = []
-    for row in scorecard:
-        if row["name"] == "Market Health":
-            lines.append(f"Health Score: {row['value']}/100 ({row['signal']})")
-        else:
-            val = row["value"]
-            chg = row["change_pct"]
-            if isinstance(chg, (int, float)):
-                lines.append(f"{row['name']}: {val:,.2f} ({chg:+.2f}%) [{row['signal']}]")
-            else:
-                lines.append(f"{row['name']}: {val} [{row['signal']}]")
-    return "\n".join(lines)

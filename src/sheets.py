@@ -2,14 +2,20 @@
 sheets.py
 Google Sheets integration for the T212 Portfolio Checker.
 
-Three tabs:
-  - Portfolio:  Symbol | Qty | Avg Price | Current Price | P/L | Value | Weight %
-                | Verdict | Fair Value | Risk | Key Note | Updated
-  - Signals:    Date | Type | Indicator | Value | Reading | Signal
-                | Success Rate | Timeframe | Updated
-  - Alerts:     Symbol | Metric | Condition | Threshold | Type
-                | Current | Status | Last Checked
-                (user fills A-E, system fills F-H)
+Five tabs:
+  - Portfolio:        Symbol | Qty | Avg Price | Current Price | P/L | Value | Weight %
+                      | Verdict | Fair Value | Risk | Key Note | Updated
+  - Signals:          Date | Type | Indicator | Value | Reading | Signal
+                      | Success Rate | Timeframe | Updated
+  - Alerts:           Symbol | Metric | Condition | Threshold | Type
+                      | Current | Status | Last Checked
+                      (user fills A-E, system fills F-H)
+  - Scanner:          Enabled | Metric | Condition | Value | Universe
+                      | Last Run | Matches
+                      (user fills A-E, system fills F-G)
+  - Scanner Results:  Date | Symbol | Name | Price | P/E | Fwd P/E | Mkt Cap
+                      | Rev Growth | Margin | D/E | RSI | vs 200-DMA
+                      | vs 52w High | Beta | Div Yield | Score | Updated
 
 Authentication: Google Service Account via GOOGLE_SA_JSON env var.
 Sheet ID: GOOGLE_SHEET_ID env var (must be set to an existing spreadsheet).
@@ -35,6 +41,8 @@ SCOPES = [
 TAB_PORTFOLIO = "Portfolio"
 TAB_SIGNALS = "Signals"
 TAB_ALERTS = "Alerts"
+TAB_SCANNER = "Scanner"
+TAB_SCANNER_RESULTS = "Scanner Results"
 
 # Column headers
 PORTFOLIO_HEADERS = [
@@ -51,6 +59,17 @@ SIGNAL_HEADERS = [
 ALERT_HEADERS = [
     "Symbol", "Metric", "Condition", "Threshold", "Type",
     "Current", "Status", "Last Checked",
+]
+
+SCANNER_HEADERS = [
+    "Enabled", "Metric", "Condition", "Value", "Universe",
+    "Last Run", "Matches",
+]
+
+SCANNER_RESULTS_HEADERS = [
+    "Date", "Symbol", "Name", "Price", "P/E", "Fwd P/E", "Mkt Cap",
+    "Rev Growth", "Margin", "D/E", "RSI (14d)", "vs 200-DMA",
+    "vs 52w High", "Beta", "Div Yield", "Score", "Updated",
 ]
 
 
@@ -70,7 +89,7 @@ def _ensure_tabs_exist(sheets_service, sheet_id: str) -> None:
     spreadsheet = sheets_service.spreadsheets().get(spreadsheetId=sheet_id).execute()
     existing_tabs = {s["properties"]["title"] for s in spreadsheet["sheets"]}
 
-    required_tabs = [TAB_PORTFOLIO, TAB_SIGNALS, TAB_ALERTS]
+    required_tabs = [TAB_PORTFOLIO, TAB_SIGNALS, TAB_ALERTS, TAB_SCANNER, TAB_SCANNER_RESULTS]
     missing = [t for t in required_tabs if t not in existing_tabs]
     if not missing:
         return
@@ -84,6 +103,8 @@ def _ensure_tabs_exist(sheets_service, sheet_id: str) -> None:
         TAB_PORTFOLIO: PORTFOLIO_HEADERS,
         TAB_SIGNALS: SIGNAL_HEADERS,
         TAB_ALERTS: ALERT_HEADERS,
+        TAB_SCANNER: SCANNER_HEADERS,
+        TAB_SCANNER_RESULTS: SCANNER_RESULTS_HEADERS,
     }
     header_data = [
         {"range": f"'{tab}'!A1", "values": [headers_map[tab]]}
@@ -375,6 +396,136 @@ class SheetManager:
             valueInputOption="RAW",
             body={"values": [[f"{current_value:.2f}", status, now]]},
         ).execute()
+
+    # ── Scanner tab ─────────────────────────────────────────────────────────────
+    # Columns: Enabled | Metric | Condition | Value | Universe
+    #          | Last Run | Matches
+    # User fills A-E, system fills F-G
+
+    def get_scanner_conditions(self) -> tuple[list[dict], str]:
+        """
+        Read scanner conditions from the Scanner tab.
+        Returns (conditions, universe_string).
+        conditions: list of {metric, condition, value} for enabled rows.
+        universe_string: from the first enabled row's Universe column (col E).
+        """
+        rows = self._read_tab(TAB_SCANNER)
+        conditions = []
+        universe = ""
+        for row in rows:
+            if len(row) < 4:
+                continue
+            enabled = (row[0].strip().upper() if row[0] else "")
+            if enabled not in ("TRUE", "YES", "Y", "1", "X"):
+                continue
+            conditions.append({
+                "metric": row[1].strip().lower() if row[1] else "",
+                "condition": row[2].strip() if row[2] else "",
+                "value": row[3].strip() if row[3] else "",
+            })
+            # Universe from the first enabled row that has one
+            if not universe and len(row) > 4 and row[4]:
+                universe = row[4].strip()
+        # Filter out rows with missing fields
+        conditions = [c for c in conditions if c["metric"] and c["condition"] and c["value"]]
+        return conditions, universe
+
+    def update_scanner_status(self, match_count: int) -> None:
+        """Update Last Run and Matches columns (F-G) on the first data row of Scanner tab."""
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        rows = self._read_tab(TAB_SCANNER)
+        for i, row in enumerate(rows):
+            if len(row) >= 1 and row[0]:
+                enabled = row[0].strip().upper()
+                if enabled in ("TRUE", "YES", "Y", "1", "X"):
+                    # Update this row's F-G columns
+                    self.sheets.spreadsheets().values().update(
+                        spreadsheetId=self.sheet_id,
+                        range=f"'{TAB_SCANNER}'!F{i + 2}",
+                        valueInputOption="RAW",
+                        body={"values": [[now, str(match_count)]]},
+                    ).execute()
+                    return
+
+    def _set_scanner_checkboxes(self, num_rows: int) -> None:
+        """Apply checkbox data validation to Enabled column (A) for all data rows."""
+        if num_rows <= 0:
+            return
+        try:
+            spreadsheet = self.sheets.spreadsheets().get(spreadsheetId=self.sheet_id).execute()
+            tab_sheet_id = None
+            for s in spreadsheet["sheets"]:
+                if s["properties"]["title"] == TAB_SCANNER:
+                    tab_sheet_id = s["properties"]["sheetId"]
+                    break
+            if tab_sheet_id is None:
+                return
+            request = {
+                "setDataValidation": {
+                    "range": {
+                        "sheetId": tab_sheet_id,
+                        "startRowIndex": 1,
+                        "endRowIndex": 1 + num_rows,
+                        "startColumnIndex": 0,  # column A
+                        "endColumnIndex": 1,
+                    },
+                    "rule": {
+                        "condition": {"type": "BOOLEAN"},
+                        "showCustomUi": True,
+                    },
+                }
+            }
+            self.sheets.spreadsheets().batchUpdate(
+                spreadsheetId=self.sheet_id,
+                body={"requests": [request]},
+            ).execute()
+        except Exception as e:
+            log.warning("Failed to set scanner checkboxes: %s", e)
+
+    # ── Scanner Results tab ───────────────────────────────────────────────────
+    # Columns: Date | Symbol | Name | Price | P/E | Fwd P/E | Mkt Cap
+    #          | Rev Growth | Margin | D/E | RSI (14d) | vs 200-DMA
+    #          | vs 52w High | Beta | Div Yield | Score | Updated
+
+    def write_scanner_results(self, matches: list[dict]) -> None:
+        """
+        Write scanner matches to the Scanner Results tab.
+        Replaces today's results, keeps previous days.
+        Each match: {symbol, name, price, pe, fwd_pe, mkt_cap, rev_growth,
+                     margin, de, rsi, vs_200dma, vs_52w, beta, div_yield, score}
+        """
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        existing = self._read_tab(TAB_SCANNER_RESULTS)
+
+        # Keep rows from previous days only
+        kept = [r for r in existing if not (len(r) >= 1 and r[0] == today)]
+
+        new_rows = []
+        for m in matches:
+            new_rows.append([
+                today,
+                m.get("symbol", ""),
+                m.get("name", ""),
+                m.get("price", ""),
+                m.get("pe", ""),
+                m.get("fwd_pe", ""),
+                m.get("mkt_cap", ""),
+                m.get("rev_growth", ""),
+                m.get("margin", ""),
+                m.get("de", ""),
+                m.get("rsi", ""),
+                m.get("vs_200dma", ""),
+                m.get("vs_52w", ""),
+                m.get("beta", ""),
+                m.get("div_yield", ""),
+                str(m.get("score", "")),
+                now,
+            ])
+
+        all_rows = [SCANNER_RESULTS_HEADERS] + new_rows + kept
+        self._write_tab(TAB_SCANNER_RESULTS, all_rows)
+        log.info("Scanner Results tab updated: %d matches for %s.", len(new_rows), today)
 
     # ── Helpers ────────────────────────────────────────────────────────────────
 
