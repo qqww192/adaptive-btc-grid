@@ -5,6 +5,18 @@ user-defined conditions from the Scanner sheet tab.
 
 Uses yfinance only (zero Gemini calls).
 
+Universes are fetched dynamically from Wikipedia:
+  - US_SP500:     Full S&P 500 (~500 tickers)
+  - US_NASDAQ100: Full NASDAQ-100 (~100 tickers)
+  - US_ALL:       S&P 500 + NASDAQ-100 deduplicated (~530 tickers)
+  - LSE_FTSE100:  Full FTSE 100 (~100 tickers)
+  - LSE_FTSE250:  Full FTSE 250 (~250 tickers)
+  - LSE_ALL:      FTSE 100 + FTSE 250 (~350 tickers)
+  - ALL:          US_ALL + LSE_ALL (~880 tickers)
+  - CUSTOM:AAPL,SHEL.L,...  — user-defined list
+
+Falls back to hardcoded lists if Wikipedia fetch fails.
+
 Two-pass filtering:
   Pass 1: Filter on .info-based metrics (P/E, market cap, growth, etc.)
   Pass 2: For survivors, fetch price history for computed metrics (RSI, DMA)
@@ -15,74 +27,194 @@ import time
 from typing import Any
 
 import numpy as np
+import pandas as pd
 import yfinance as yf
 
 log = logging.getLogger(__name__)
 
-# ── Stock Universes ──────────────────────────────────────────────────────────
-# yfinance tickers. LSE stocks use .L suffix.
+# ── Dynamic universe fetching from Wikipedia ─────────────────────────────────
 
-US_MEGA50 = [
+_WIKI_SP500 = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+_WIKI_NASDAQ100 = "https://en.wikipedia.org/wiki/Nasdaq-100"
+_WIKI_FTSE100 = "https://en.wikipedia.org/wiki/FTSE_100_Index"
+_WIKI_FTSE250 = "https://en.wikipedia.org/wiki/FTSE_250_Index"
+
+
+def _fetch_wiki_table(url: str, ticker_col: str, suffix: str = "",
+                      table_index: int = 0) -> list[str]:
+    """Fetch a ticker list from a Wikipedia table using pandas.read_html."""
+    try:
+        tables = pd.read_html(url)
+        if table_index >= len(tables):
+            log.warning("Wikipedia table index %d out of range for %s", table_index, url)
+            return []
+        df = tables[table_index]
+        # Try exact column name first, then case-insensitive search
+        col = None
+        if ticker_col in df.columns:
+            col = ticker_col
+        else:
+            for c in df.columns:
+                if ticker_col.lower() in str(c).lower():
+                    col = c
+                    break
+        if col is None:
+            log.warning("Column '%s' not found in Wikipedia table from %s. Columns: %s",
+                        ticker_col, url, list(df.columns))
+            return []
+        tickers = df[col].dropna().astype(str).str.strip().tolist()
+        # Clean tickers: remove any with spaces or empty
+        tickers = [t for t in tickers if t and " " not in t and t != "nan"]
+        if suffix:
+            tickers = [f"{t}{suffix}" if not t.endswith(suffix) else t for t in tickers]
+        log.info("Fetched %d tickers from %s", len(tickers), url)
+        return tickers
+    except Exception as e:
+        log.warning("Failed to fetch tickers from %s: %s", url, e)
+        return []
+
+
+def fetch_sp500() -> list[str]:
+    """Fetch full S&P 500 constituent list."""
+    tickers = _fetch_wiki_table(_WIKI_SP500, "Symbol")
+    # Wikipedia S&P 500 uses dots (BRK.B) but yfinance uses dashes (BRK-B)
+    tickers = [t.replace(".", "-") for t in tickers]
+    return tickers if tickers else _FALLBACK_US
+
+
+def fetch_nasdaq100() -> list[str]:
+    """Fetch full NASDAQ-100 constituent list."""
+    tickers = _fetch_wiki_table(_WIKI_NASDAQ100, "Ticker")
+    return tickers if tickers else _FALLBACK_US[:100]
+
+
+def fetch_ftse100() -> list[str]:
+    """Fetch full FTSE 100 constituent list (with .L suffix for yfinance)."""
+    # FTSE 100 Wikipedia table has "Ticker" column, sometimes as "EPIC"
+    tickers = _fetch_wiki_table(_WIKI_FTSE100, "EPIC", suffix=".L")
+    if not tickers:
+        tickers = _fetch_wiki_table(_WIKI_FTSE100, "Ticker", suffix=".L")
+    return tickers if tickers else _FALLBACK_LSE
+
+
+def fetch_ftse250() -> list[str]:
+    """Fetch full FTSE 250 constituent list (with .L suffix for yfinance)."""
+    tickers = _fetch_wiki_table(_WIKI_FTSE250, "EPIC", suffix=".L")
+    if not tickers:
+        tickers = _fetch_wiki_table(_WIKI_FTSE250, "Ticker", suffix=".L")
+    return tickers if tickers else _FALLBACK_LSE_250
+
+
+# ── Hardcoded fallbacks (used when Wikipedia is unreachable) ─────────────────
+
+_FALLBACK_US = [
     "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "BRK-B", "LLY", "AVGO", "JPM",
     "TSLA", "UNH", "XOM", "V", "MA", "PG", "JNJ", "COST", "HD", "ABBV",
     "WMT", "NFLX", "KO", "MRK", "CRM", "BAC", "CVX", "PEP", "AMD", "TMO",
     "LIN", "ADBE", "ORCL", "ACN", "MCD", "CSCO", "ABT", "WFC", "GE", "DHR",
     "TXN", "PM", "QCOM", "INTU", "ISRG", "AMGN", "CAT", "NOW", "IBM", "GS",
-]
-
-US_LARGE100 = US_MEGA50 + [
     "RTX", "VZ", "AMAT", "NEE", "LOW", "SPGI", "BLK", "HON", "UNP", "DE",
     "PFE", "T", "ADP", "BKNG", "MDLZ", "SCHW", "CI", "LMT", "MMC", "SYK",
     "GILD", "CB", "ADI", "LRCX", "TMUS", "SO", "ZTS", "DUK", "MO", "CL",
     "REGN", "CME", "BSX", "PLD", "ICE", "PYPL", "SNPS", "CDNS", "EQIX", "AON",
     "MCK", "ITW", "SHW", "ABNB", "PGR", "KLAC", "APH", "MSI", "WELL", "CRWD",
-]
-
-US_SP500_EXTENDED = US_LARGE100 + [
     "EMR", "CTAS", "ORLY", "ADSK", "MAR", "GM", "F", "ROP", "MCHP", "NXPI",
     "HCA", "AJG", "TT", "PSA", "FTNT", "CARR", "OKE", "MNST", "AEP", "AIG",
     "FAST", "DLR", "SRE", "ALL", "CCI", "PAYX", "KMB", "MSCI", "GIS", "EA",
     "ROST", "TEL", "D", "HLT", "VRSK", "BK", "WEC", "YUM", "CTSH", "DXCM",
     "PCAR", "STZ", "EXC", "HPQ", "IDXX", "CPRT", "ODFL", "ON", "CSGP", "GEHC",
-    "KDP", "AWK", "WBD", "DOV", "GPN", "ANSS", "KEYS", "CDW", "MPWR", "MTD",
-    "EFX", "WAT", "BR", "VLTO", "FSLR", "WST", "TRGP", "RCL", "CCL", "DAL",
-    "UAL", "LUV", "ALB", "FMC", "ENPH", "SEDG", "PLUG", "RIVN", "LCID", "NIO",
-    "SOFI", "PLTR", "SNOW", "DDOG", "NET", "ZS", "PANW", "OKTA", "HUBS", "BILL",
-    "SQ", "SHOP", "MELI", "SE", "GRAB", "NU", "COIN", "HOOD", "RBLX", "U",
+    "SQ", "SHOP", "MELI", "PLTR", "SNOW", "DDOG", "NET", "PANW", "COIN", "SOFI",
 ]
 
-LSE_FTSE100 = [
+_FALLBACK_LSE = [
     "AZN.L", "SHEL.L", "HSBA.L", "ULVR.L", "BP.L", "GSK.L", "RIO.L", "BATS.L",
     "DGE.L", "LSEG.L", "REL.L", "NG.L", "CRH.L", "AHT.L", "AAL.L", "GLEN.L",
     "RKT.L", "CPG.L", "MNG.L", "PRU.L", "SSE.L", "VOD.L", "BA.L", "LLOY.L",
     "BARC.L", "STAN.L", "NWG.L", "ANTO.L", "ABF.L", "BT-A.L", "WPP.L", "III.L",
-    "TSCO.L", "SGRO.L", "PSON.L", "INF.L", "IMB.L", "AV.L", "LGEN.L", "HLMA.L",
+    "TSCO.L", "PSON.L", "INF.L", "IMB.L", "AV.L", "LGEN.L", "HLMA.L",
     "SVT.L", "UU.L", "ADM.L", "SN.L", "SDR.L", "RR.L", "EXPN.L", "IHG.L",
-    "BNZL.L", "WEIR.L", "SGPG.L", "SMT.L", "SPX.L", "LAND.L", "EDV.L", "AUTO.L",
-    "BRBY.L", "ENT.L", "SBRY.L", "KGF.L", "WTB.L", "MNDI.L", "SMIN.L", "BDEV.L",
-    "TW.L", "JD.L", "HIK.L", "DARK.L", "FRAS.L", "HSX.L", "ITRK.L", "CRDA.L",
-    "BME.L", "SMDS.L", "PSN.L", "RTO.L", "RS1.L", "HLN.L", "FLTR.L", "IAG.L",
-    "EZJ.L", "WIZZ.L", "PHNX.L", "SJP.L", "JMAT.L", "DPLM.L", "HWDN.L",
-    "FCIT.L", "BBOX.L", "BNKR.L", "CTY.L", "CGT.L", "TRIG.L", "UKW.L",
+    "BNZL.L", "WEIR.L", "SMT.L", "SPX.L", "AUTO.L", "BRBY.L", "ENT.L",
+    "SBRY.L", "KGF.L", "WTB.L", "MNDI.L", "SMIN.L", "BDEV.L", "JD.L",
+    "HIK.L", "DARK.L", "FRAS.L", "ITRK.L", "CRDA.L", "BME.L", "PSN.L",
+    "RTO.L", "HLN.L", "FLTR.L", "IAG.L", "EZJ.L", "PHNX.L", "DPLM.L",
 ]
 
-LSE_FTSE250_TOP = [
-    "CINE.L", "FOUR.L", "GAW.L", "GBPG.L", "GNS.L", "HTWS.L", "IGG.L",
-    "ITV.L", "JET2.L", "LTHM.L", "MGGT.L", "NXT.L", "OCDO.L", "PDG.L",
-    "PETS.L", "RWS.L", "SFR.L", "TRN.L", "VCT.L", "VSVS.L",
-    "WHR.L", "WIX.L", "YOU.L", "ASC.L", "BNZL.L", "DOCS.L",
-    "FDEV.L", "FUTR.L", "GRG.L", "IPO.L",
+_FALLBACK_LSE_250 = [
+    "NXT.L", "ITV.L", "JET2.L", "GAW.L", "FOUR.L", "GNS.L",
+    "PETS.L", "TRN.L", "FUTR.L", "GRG.L", "DOCS.L", "IPO.L",
 ]
 
-UNIVERSES: dict[str, list[str]] = {
-    "US_MEGA50": US_MEGA50,
-    "US_LARGE100": US_LARGE100,
-    "US_SP500": US_SP500_EXTENDED,
-    "LSE_FTSE100": LSE_FTSE100,
-    "LSE_FTSE250": LSE_FTSE250_TOP,
-    "LSE_ALL": LSE_FTSE100 + LSE_FTSE250_TOP,
-    "ALL": US_LARGE100 + LSE_FTSE100,
-}
+
+# ── Universe resolution ──────────────────────────────────────────────────────
+
+def _dedup(tickers: list[str]) -> list[str]:
+    """Deduplicate preserving order."""
+    seen = set()
+    result = []
+    for t in tickers:
+        if t not in seen:
+            seen.add(t)
+            result.append(t)
+    return result
+
+
+def _resolve_single_universe(name: str) -> list[str]:
+    """Resolve a single universe name to tickers."""
+    name = name.strip().upper()
+    resolvers = {
+        "US_SP500":     fetch_sp500,
+        "US_NASDAQ100": fetch_nasdaq100,
+        "US_ALL":       lambda: _dedup(fetch_sp500() + fetch_nasdaq100()),
+        "LSE_FTSE100":  fetch_ftse100,
+        "LSE_FTSE250":  fetch_ftse250,
+        "LSE_ALL":      lambda: _dedup(fetch_ftse100() + fetch_ftse250()),
+        "ALL":          lambda: _dedup(fetch_sp500() + fetch_nasdaq100() +
+                                       fetch_ftse100() + fetch_ftse250()),
+    }
+    resolver = resolvers.get(name)
+    if resolver:
+        return resolver()
+    log.warning("Scanner: unknown universe '%s', skipping.", name)
+    return []
+
+
+def resolve_universe(universe_str: str) -> list[str]:
+    """
+    Resolve a universe string to a list of tickers.
+
+    Supports:
+      'US_SP500'              — full S&P 500 (~500)
+      'US_NASDAQ100'          — full NASDAQ-100 (~100)
+      'US_ALL'                — S&P 500 + NASDAQ-100 (~530)
+      'LSE_FTSE100'           — full FTSE 100 (~100)
+      'LSE_FTSE250'           — full FTSE 250 (~250)
+      'LSE_ALL'               — FTSE 100 + FTSE 250 (~350)
+      'ALL'                   — everything (~880)
+      'US_SP500,LSE_FTSE100'  — comma-separated mix
+      'CUSTOM:AAPL,SHEL.L'   — explicit ticker list
+    """
+    universe_str = universe_str.strip()
+    if not universe_str:
+        return _FALLBACK_US[:50]
+
+    # Custom ticker list
+    if universe_str.upper().startswith("CUSTOM:"):
+        tickers = [t.strip() for t in universe_str[7:].split(",") if t.strip()]
+        return tickers
+
+    # Single or comma-separated universe names
+    combined = []
+    for name in universe_str.split(","):
+        combined.extend(_resolve_single_universe(name))
+
+    result = _dedup(combined)
+    if not result:
+        log.warning("Scanner: no tickers resolved, falling back to US top 50.")
+        return _FALLBACK_US[:50]
+
+    log.info("Scanner: resolved %d tickers from '%s'", len(result), universe_str)
+    return result
+
 
 # ── Metrics ──────────────────────────────────────────────────────────────────
 
@@ -121,15 +253,6 @@ def _compute_rsi(prices: list[float], period: int = 14) -> float:
 
 
 # ── Data fetching ────────────────────────────────────────────────────────────
-
-def _fetch_info(symbol: str) -> dict[str, Any]:
-    """Fetch .info dict for a single ticker. Returns empty dict on failure."""
-    try:
-        return yf.Ticker(symbol).info or {}
-    except Exception as e:
-        log.warning("Scanner: failed to fetch info for %s: %s", symbol, e)
-        return {}
-
 
 def _fetch_info_batch(symbols: list[str]) -> dict[str, dict]:
     """Fetch .info for a batch of tickers."""
@@ -310,40 +433,6 @@ def _fmt_num(val: float | None, decimals: int = 1) -> str:
 
 # ── Main scan ────────────────────────────────────────────────────────────────
 
-def resolve_universe(universe_str: str) -> list[str]:
-    """
-    Resolve a universe string to a list of tickers.
-    Supports: 'US_MEGA50', 'LSE_FTSE100', 'CUSTOM:AAPL,MSFT,...', or
-    comma-separated universe names like 'US_MEGA50,LSE_FTSE100'.
-    """
-    universe_str = universe_str.strip()
-    if not universe_str:
-        return US_MEGA50
-
-    # Custom ticker list
-    if universe_str.upper().startswith("CUSTOM:"):
-        tickers = [t.strip() for t in universe_str[7:].split(",") if t.strip()]
-        return tickers
-
-    # Single or comma-separated universe names
-    combined = []
-    for name in universe_str.split(","):
-        name = name.strip().upper()
-        if name in UNIVERSES:
-            combined.extend(UNIVERSES[name])
-        else:
-            log.warning("Scanner: unknown universe '%s', skipping.", name)
-
-    # Deduplicate preserving order
-    seen = set()
-    deduped = []
-    for t in combined:
-        if t not in seen:
-            seen.add(t)
-            deduped.append(t)
-    return deduped if deduped else US_MEGA50
-
-
 def run_scan(conditions: list[dict], universe: list[str]) -> list[dict]:
     """
     Run the stock scanner.
@@ -369,8 +458,9 @@ def run_scan(conditions: list[dict], universe: list[str]) -> list[dict]:
     for i in range(0, len(universe), batch_size):
         batch = universe[i:i + batch_size]
         if i > 0:
-            time.sleep(0.5)  # gentle rate limiting
+            time.sleep(0.5)  # gentle rate limiting for yfinance
         infos = _fetch_info_batch(batch)
+        batch_pass = 0
         for sym in batch:
             info = infos.get(sym, {})
             if not info:
@@ -379,10 +469,10 @@ def run_scan(conditions: list[dict], universe: list[str]) -> list[dict]:
             data["_symbol"] = sym
             if not pass1_conds or _passes_all(data, pass1_conds):
                 survivors.append(data)
+                batch_pass += 1
         log.info("  Batch %d-%d: %d/%d survived pass 1.",
                  i + 1, min(i + batch_size, len(universe)),
-                 len([s for s in survivors[len(survivors) - len(batch):]]),
-                 len(batch))
+                 batch_pass, len(batch))
 
     log.info("Scanner pass 1 complete: %d/%d survived.", len(survivors), len(universe))
 
