@@ -10,9 +10,10 @@ Five tabs:
   - Alerts:           Symbol | Metric | Condition | Threshold | Type
                       | Current | Status | Last Checked
                       (user fills A-E, system fills F-H)
-  - Scanner:          Enabled | Metric | Condition | Value | Universe
+  - Scanner:          Enabled | Group | Metric | Condition | Value | Universe
                       | Last Run | Matches
-                      (user fills A-E, system fills F-G)
+                      (user fills A-F, system fills G-H)
+                      Conditions in same Group = AND, different Groups = OR
   - Scanner Results:  Date | Symbol | Name | Price | P/E | Fwd P/E | Mkt Cap
                       | Rev Growth | Margin | D/E | RSI | vs 200-DMA
                       | vs 52w High | Beta | Div Yield | Score | Updated
@@ -62,14 +63,14 @@ ALERT_HEADERS = [
 ]
 
 SCANNER_HEADERS = [
-    "Enabled", "Metric", "Condition", "Value", "Universe",
+    "Enabled", "Group", "Metric", "Condition", "Value", "Universe",
     "Last Run", "Matches",
 ]
 
 SCANNER_RESULTS_HEADERS = [
     "Date", "Symbol", "Name", "Price", "P/E", "Fwd P/E", "Mkt Cap",
     "Rev Growth", "Margin", "D/E", "RSI (14d)", "vs 200-DMA",
-    "vs 52w High", "Beta", "Div Yield", "Score", "Updated",
+    "vs 52w High", "Beta", "Div Yield", "Score", "Matched Group", "Updated",
 ]
 
 
@@ -398,50 +399,57 @@ class SheetManager:
         ).execute()
 
     # ── Scanner tab ─────────────────────────────────────────────────────────────
-    # Columns: Enabled | Metric | Condition | Value | Universe
+    # Columns: Enabled | Group | Metric | Condition | Value | Universe
     #          | Last Run | Matches
-    # User fills A-E, system fills F-G
+    # User fills A-F, system fills G-H
+    # Conditions in same Group = AND, different Groups = OR
 
-    def get_scanner_conditions(self) -> tuple[list[dict], str]:
+    def get_scanner_conditions(self) -> tuple[dict[str, list[dict]], str]:
         """
-        Read scanner conditions from the Scanner tab.
-        Returns (conditions, universe_string).
-        conditions: list of {metric, condition, value} for enabled rows.
-        universe_string: from the first enabled row's Universe column (col E).
+        Read scanner conditions from the Scanner tab, grouped by Group column.
+
+        Returns (groups, universe_string).
+        groups: dict mapping group name -> list of {metric, condition, value}
+                Conditions within a group are AND'd.
+                Different groups are OR'd (stock passes if it matches ANY group).
+        universe_string: from the first enabled row's Universe column (col F).
         """
         rows = self._read_tab(TAB_SCANNER)
-        conditions = []
+        groups: dict[str, list[dict]] = {}
         universe = ""
         for row in rows:
-            if len(row) < 4:
+            if len(row) < 5:
                 continue
             enabled = (row[0].strip().upper() if row[0] else "")
             if enabled not in ("TRUE", "YES", "Y", "1", "X"):
                 continue
-            conditions.append({
-                "metric": row[1].strip().lower() if row[1] else "",
-                "condition": row[2].strip() if row[2] else "",
-                "value": row[3].strip() if row[3] else "",
+            group = row[1].strip() if row[1] else "Default"
+            metric = row[2].strip().lower() if row[2] else ""
+            condition = row[3].strip() if row[3] else ""
+            value = row[4].strip() if row[4] else ""
+            if not metric or not condition or not value:
+                continue
+            groups.setdefault(group, []).append({
+                "metric": metric,
+                "condition": condition,
+                "value": value,
             })
             # Universe from the first enabled row that has one
-            if not universe and len(row) > 4 and row[4]:
-                universe = row[4].strip()
-        # Filter out rows with missing fields
-        conditions = [c for c in conditions if c["metric"] and c["condition"] and c["value"]]
-        return conditions, universe
+            if not universe and len(row) > 5 and row[5]:
+                universe = row[5].strip()
+        return groups, universe
 
     def update_scanner_status(self, match_count: int) -> None:
-        """Update Last Run and Matches columns (F-G) on the first data row of Scanner tab."""
+        """Update Last Run and Matches columns (G-H) on the first data row of Scanner tab."""
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         rows = self._read_tab(TAB_SCANNER)
         for i, row in enumerate(rows):
             if len(row) >= 1 and row[0]:
                 enabled = row[0].strip().upper()
                 if enabled in ("TRUE", "YES", "Y", "1", "X"):
-                    # Update this row's F-G columns
                     self.sheets.spreadsheets().values().update(
                         spreadsheetId=self.sheet_id,
-                        range=f"'{TAB_SCANNER}'!F{i + 2}",
+                        range=f"'{TAB_SCANNER}'!G{i + 2}",
                         valueInputOption="RAW",
                         body={"values": [[now, str(match_count)]]},
                     ).execute()
@@ -485,14 +493,15 @@ class SheetManager:
     # ── Scanner Results tab ───────────────────────────────────────────────────
     # Columns: Date | Symbol | Name | Price | P/E | Fwd P/E | Mkt Cap
     #          | Rev Growth | Margin | D/E | RSI (14d) | vs 200-DMA
-    #          | vs 52w High | Beta | Div Yield | Score | Updated
+    #          | vs 52w High | Beta | Div Yield | Score | Matched Group | Updated
 
     def write_scanner_results(self, matches: list[dict]) -> None:
         """
         Write scanner matches to the Scanner Results tab.
         Replaces today's results, keeps previous days.
         Each match: {symbol, name, price, pe, fwd_pe, mkt_cap, rev_growth,
-                     margin, de, rsi, vs_200dma, vs_52w, beta, div_yield, score}
+                     margin, de, rsi, vs_200dma, vs_52w, beta, div_yield,
+                     score, matched_groups}
         """
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -520,6 +529,7 @@ class SheetManager:
                 m.get("beta", ""),
                 m.get("div_yield", ""),
                 str(m.get("score", "")),
+                m.get("matched_groups", ""),
                 now,
             ])
 
