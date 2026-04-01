@@ -433,26 +433,65 @@ def _fmt_num(val: float | None, decimals: int = 1) -> str:
 
 # ── Main scan ────────────────────────────────────────────────────────────────
 
-def run_scan(conditions: list[dict], universe: list[str]) -> list[dict]:
+def _split_groups_by_pass(
+    groups: dict[str, list[dict]],
+) -> tuple[dict[str, list[dict]], dict[str, list[dict]], bool]:
     """
-    Run the stock scanner.
-    conditions: list of {metric, condition, value}
+    Split each group's conditions into pass-1 (info) and pass-2 (history).
+    Returns (pass1_groups, pass2_groups, needs_pass2).
+    """
+    pass1: dict[str, list[dict]] = {}
+    pass2: dict[str, list[dict]] = {}
+    needs_pass2 = False
+    for group_name, conds in groups.items():
+        p1 = [c for c in conds if c["metric"] not in COMPUTED_METRICS]
+        p2 = [c for c in conds if c["metric"] in COMPUTED_METRICS]
+        if p1:
+            pass1[group_name] = p1
+        if p2:
+            pass2[group_name] = p2
+            needs_pass2 = True
+    return pass1, pass2, needs_pass2
+
+
+def _check_any_group(stock_data: dict, groups: dict[str, list[dict]]) -> list[str]:
+    """
+    Check if stock passes ANY group (OR logic between groups).
+    Within each group, ALL conditions must pass (AND logic).
+    Returns list of matched group names.
+    """
+    matched = []
+    for group_name, conds in groups.items():
+        if _passes_all(stock_data, conds):
+            matched.append(group_name)
+    return matched
+
+
+def run_scan(groups: dict[str, list[dict]], universe: list[str]) -> list[dict]:
+    """
+    Run the stock scanner with grouped conditions.
+
+    groups: dict mapping group name -> list of {metric, condition, value}
+            Conditions within a group are AND'd.
+            Different groups are OR'd (stock passes if it matches ANY group).
     universe: list of yfinance ticker strings
 
     Returns list of matching stocks with all metric data, sorted by score.
     """
-    if not conditions or not universe:
+    if not groups or not universe:
         return []
 
-    # Split conditions into pass-1 (info) and pass-2 (history)
-    pass1_conds = [c for c in conditions if c["metric"] not in COMPUTED_METRICS]
-    pass2_conds = [c for c in conditions if c["metric"] in COMPUTED_METRICS]
-    needs_pass2 = len(pass2_conds) > 0
+    # All conditions flat (for scoring)
+    all_conditions = [c for conds in groups.values() for c in conds]
+    total_conds = len(all_conditions)
 
-    log.info("Scanner: %d tickers, %d conditions (pass1=%d, pass2=%d)",
-             len(universe), len(conditions), len(pass1_conds), len(pass2_conds))
+    # Split into pass-1 and pass-2 per group
+    pass1_groups, pass2_groups, needs_pass2 = _split_groups_by_pass(groups)
 
-    # ── Pass 1: filter on .info metrics ──────────────────────────────────────
+    log.info("Scanner: %d tickers, %d group(s) [%s], %d total conditions",
+             len(universe), len(groups), ", ".join(groups.keys()), total_conds)
+
+    # ── Pass 1: filter on .info metrics (OR across groups) ───────────────────
     survivors = []
     batch_size = 20
     for i in range(0, len(universe), batch_size):
@@ -467,9 +506,18 @@ def run_scan(conditions: list[dict], universe: list[str]) -> list[dict]:
                 continue
             data = _extract_info_metrics(info)
             data["_symbol"] = sym
-            if not pass1_conds or _passes_all(data, pass1_conds):
+            # Stock survives pass 1 if it matches ANY group's pass-1 conditions
+            if not pass1_groups:
+                # No info-based conditions — all survive pass 1
+                data["_p1_groups"] = list(groups.keys())
                 survivors.append(data)
                 batch_pass += 1
+            else:
+                matched = _check_any_group(data, pass1_groups)
+                if matched:
+                    data["_p1_groups"] = matched
+                    survivors.append(data)
+                    batch_pass += 1
         log.info("  Batch %d-%d: %d/%d survived pass 1.",
                  i + 1, min(i + batch_size, len(universe)),
                  batch_pass, len(batch))
@@ -484,11 +532,24 @@ def run_scan(conditions: list[dict], universe: list[str]) -> list[dict]:
             sym = stock["_symbol"]
             hist_data = _compute_history_metrics(sym)
             stock.update(hist_data)
-            if _passes_all(stock, pass2_conds):
+
+            # For each group that passed pass 1, check if pass 2 also passes
+            p1_matched = stock.get("_p1_groups", [])
+            final_matched = []
+            for gname in p1_matched:
+                p2_conds = pass2_groups.get(gname, [])
+                if not p2_conds or _passes_all(stock, p2_conds):
+                    final_matched.append(gname)
+            if final_matched:
+                stock["_matched_groups"] = final_matched
                 final.append(stock)
             time.sleep(0.3)
         log.info("Scanner pass 2 complete: %d/%d survived.", len(final), len(survivors))
         survivors = final
+    else:
+        # No pass 2 needed — carry pass 1 matches through
+        for stock in survivors:
+            stock["_matched_groups"] = stock.get("_p1_groups", [])
 
     # ── Score and sort ───────────────────────────────────────────────────────
     results = []
@@ -496,7 +557,13 @@ def run_scan(conditions: list[dict], universe: list[str]) -> list[dict]:
         price = stock.get("_price")
         if not price:
             continue
-        score = _compute_match_score(stock, conditions)
+        matched_groups = stock.get("_matched_groups", [])
+        # Score using the best-matching group's conditions
+        best_score = 0
+        for gname in matched_groups:
+            group_conds = groups.get(gname, [])
+            score = _compute_match_score(stock, group_conds)
+            best_score = max(best_score, score)
         results.append({
             "symbol": stock["_symbol"],
             "name": stock.get("_name", ""),
@@ -512,7 +579,8 @@ def run_scan(conditions: list[dict], universe: list[str]) -> list[dict]:
             "vs_52w": _fmt_num(stock.get("52w_pct")),
             "beta": _fmt_num(stock.get("beta"), 2),
             "div_yield": _fmt_pct(stock.get("dividend_yield")),
-            "score": score,
+            "score": best_score,
+            "matched_groups": ", ".join(matched_groups),
         })
 
     results.sort(key=lambda r: r["score"], reverse=True)

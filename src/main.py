@@ -220,12 +220,14 @@ def main() -> None:
     log.info("Step 3.5 — Running stock scanner...")
     try:
         from scanner import resolve_universe, run_scan
-        scanner_conditions, universe_str = sheet.get_scanner_conditions()
-        if scanner_conditions:
+        scanner_groups, universe_str = sheet.get_scanner_conditions()
+        if scanner_groups:
             universe = resolve_universe(universe_str)
-            log.info("  %d conditions, universe: %s (%d tickers)",
-                     len(scanner_conditions), universe_str or "US_MEGA50 (default)", len(universe))
-            matches = run_scan(scanner_conditions, universe)
+            total_conds = sum(len(c) for c in scanner_groups.values())
+            log.info("  %d group(s) [%s], %d conditions, universe: %s (%d tickers)",
+                     len(scanner_groups), ", ".join(scanner_groups.keys()),
+                     total_conds, universe_str or "default", len(universe))
+            matches = run_scan(scanner_groups, universe)
             sheet.write_scanner_results(matches)
             sheet.update_scanner_status(len(matches))
             if matches:
