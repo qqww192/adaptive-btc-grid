@@ -76,6 +76,10 @@ See `docs/architecture.md`. Key points:
 - Warning threshold: -5% of total capital (£7.50)
 - Grid recentres when BTC moves >3% from last calibration price
 - Regime reclassification: every 4 hours via ATR-14 + Bollinger Band Width
+- **Minimum capital:** `0.0001 BTC × BTC_price × levels ÷ capital_pct ÷ gbp_usd_rate`
+  - At BTC $105k / 10 levels / 70%: **£118 minimum** (default config)
+  - Starter option: 4 levels → **£50 minimum** (set `"levels": 4` in grid_params.json)
+  - £15 is **not viable** — per-level qty falls 13× below crypto.com's 0.0001 BTC minimum
 
 ## Self-learning loop
 - **Inner loop (every 5 min):** fill detection → risk check → order placement

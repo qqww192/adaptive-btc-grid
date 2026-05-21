@@ -379,6 +379,20 @@ def _run() -> None:
         cancel_all_and_clear(cdx, grid_state)
         grid_state["calibration_price"] = price
 
+    # Capital sufficiency check — exit if capital is below minimum for all levels
+    min_cap_usdt = MIN_QTY_BTC * price * config["levels"]
+    min_cap_gbp  = min_cap_usdt / config["capital_pct"] / config.get("gbp_usd_rate", 1.27)
+    if config["total_capital"] < min_cap_gbp:
+        msg = (
+            f"[grid] INSUFFICIENT CAPITAL — need ≥£{min_cap_gbp:.0f} for "
+            f"{config['levels']} levels at BTC ${price:,.0f}. "
+            f"Have £{config['total_capital']}. "
+            f"Reduce 'levels' in config or deposit more capital."
+        )
+        print(msg)
+        _send_telegram_alert(msg)
+        sys.exit(1)
+
     # 5. Build and place grid
     levels = build_grid(price, config)
     place_grid(cdx, levels, grid_state)
