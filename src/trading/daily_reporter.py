@@ -20,8 +20,11 @@ from trading.risk_manager  import get_state as get_risk_state
 
 
 def send(message: str) -> None:
-    token   = os.environ["TELEGRAM_BOT_TOKEN"]
-    chat_id = os.environ["TELEGRAM_CHAT_ID"]
+    token   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+    if not token or not chat_id:
+        print(f"[reporter] Telegram not configured — message: {message}")
+        return
     httpx.post(
         f"https://api.telegram.org/bot{token}/sendMessage",
         json={"chat_id": chat_id, "text": message, "parse_mode": "Markdown"},
