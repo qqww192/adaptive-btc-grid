@@ -13,8 +13,8 @@
 
 set -euo pipefail
 
-REPO_URL="https://github.com/qqww192/FinancialAdvisor.git"
-BOT_DIR="$HOME/FinancialAdvisor"
+REPO_URL="https://github.com/qqww192/BTCTradeBot.git"
+BOT_DIR="$HOME/BTCTradeBot"
 PYTHON="python3.11"
 
 echo ""
@@ -73,6 +73,8 @@ fi
 # Strip Windows CRLF line endings that break env var parsing
 sed -i 's/\r$//' "$BOT_DIR/.env"
 echo "      Stripped CRLF from .env (safe no-op if already Unix format)"
+chmod 600 "$BOT_DIR/.env"
+echo "      Locked .env permissions to owner-only (600)"
 
 # ---- 6. Create data directories ----
 echo "[6/7] Creating data directories..."
