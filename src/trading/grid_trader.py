@@ -741,22 +741,42 @@ def _check_stale_heartbeat() -> None:
     if not HEARTBEAT_FILE.exists():
         return
     try:
-        hb       = json.loads(HEARTBEAT_FILE.read_text())
-        hb_dt    = datetime.fromisoformat(hb["ts"])
-        age_min  = (datetime.now(timezone.utc) - hb_dt).total_seconds() / 60
-        if age_min > 30:
-            msg = (
-                f"⚠️ *Grid bot resumed after gap*\n"
-                f"Last heartbeat: {age_min:.0f} min ago ({hb_dt.strftime('%H:%M UTC')})\n"
-                f"Order history fetched at limit=200 — fills during downtime should be detected.\n"
-                f"Manual audit recommended if gap exceeded several hours."
-            )
-            print(f"[grid] {msg}")
-            _send_telegram_alert(msg)
-            # Stamp the heartbeat now so this alert only fires once, even if the
-            # run exits early (kill switch, price fetch failure, pause flags, etc.).
-            hb["ts"] = datetime.now(timezone.utc).isoformat()
-            HEARTBEAT_FILE.write_text(json.dumps(hb))
+        hb      = json.loads(HEARTBEAT_FILE.read_text())
+        hb_dt   = datetime.fromisoformat(hb["ts"])
+        age_min = (datetime.now(timezone.utc) - hb_dt).total_seconds() / 60
+        if age_min <= 30:
+            return
+
+        # Gather diagnostics so the alert is self-contained for review
+        price_str  = f"${hb.get('price', 0):,.0f}" if hb.get("price") else "unknown"
+        pnl_str    = f"£{hb.get('week_pnl', 0):.2f}"
+        regime_str = hb.get("regime", "unknown")
+        lock_str   = "yes — possible hung run" if LOCK_FILE.exists() else "no"
+
+        # Last error line from the log (best-effort)
+        last_err = "none found"
+        try:
+            log_path = ROOT / "logs" / "grid_trader.log"
+            if log_path.exists():
+                lines = log_path.read_text().splitlines()
+                errors = [l for l in lines if "ERROR" in l or "CRITICAL" in l or "Traceback" in l]
+                last_err = errors[-1] if errors else "none found"
+        except Exception:
+            pass
+
+        msg = (
+            f"⚠️ *Grid bot resumed after gap*\n"
+            f"Gap: {age_min:.0f} min (last heartbeat {hb_dt.strftime('%H:%M UTC')})\n"
+            f"Last known: price={price_str} | regime={regime_str} | week P&L={pnl_str}\n"
+            f"Lock file present: {lock_str}\n"
+            f"Last log error: `{last_err[-120:]}`\n"
+            f"_Paste this to Claude Code to diagnose._"
+        )
+        print(f"[grid] {msg}")
+        _send_telegram_alert(msg)
+        # Stamp now so this alert only fires once per gap, even on early exits.
+        hb["ts"] = datetime.now(timezone.utc).isoformat()
+        HEARTBEAT_FILE.write_text(json.dumps(hb))
     except Exception:
         pass
 
