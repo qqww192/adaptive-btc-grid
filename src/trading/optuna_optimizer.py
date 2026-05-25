@@ -24,6 +24,7 @@ import json
 import math
 import os
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -68,8 +69,12 @@ def simulate_return(candles: list[dict], config: dict) -> float:
     for c in candles:
         daily_range_pct = (c["high"] - c["low"]) / c["close"]
         fills           = min(daily_range_pct / spacing_pct, levels / 2)
+        # Both gross and fees must scale with capital_pct so Optuna can't inflate
+        # net return by simply increasing capital_pct while fees stay constant.
+        # The return is expressed per unit of total capital (capital_pct cancels
+        # when comparing params but prevents the bias toward always picking 0.80).
         gross           = fills * spacing_pct * capital_pct
-        fees            = fills * (fee_pct * 2 + taker_risk_pct)
+        fees            = fills * (fee_pct * 2 + taker_risk_pct) * capital_pct
         total_return   += gross - fees
 
     return round(total_return * 100, 4)
@@ -172,17 +177,26 @@ def main() -> None:
 
     candidates = run(candles, n_trials=300, regime=regime)
 
-    CANDIDATES_FILE.parent.mkdir(parents=True, exist_ok=True)
-    CANDIDATES_FILE.write_text(
-        json.dumps(
-            {
-                "generated_at": datetime.now(timezone.utc).isoformat(),
-                "regime":       regime,
-                "candidates":   candidates,
-            },
-            indent=2,
-        )
+    payload = json.dumps(
+        {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "regime":       regime,
+            "candidates":   candidates,
+        },
+        indent=2,
     )
+    CANDIDATES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=CANDIDATES_FILE.parent, prefix=".tmp_")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(payload)
+        os.replace(tmp, CANDIDATES_FILE)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     print(f"[optuna] Candidates saved to {CANDIDATES_FILE}")
 
 

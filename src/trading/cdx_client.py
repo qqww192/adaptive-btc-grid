@@ -99,6 +99,38 @@ class CDXClient:
         result = self._call(self._ex.fetch_balance)
         return float((result.get(currency) or {}).get("free") or 0)
 
+    def get_portfolio_value_gbp(self, gbp_usd_rate: float = 1.27) -> dict:
+        """
+        Return total portfolio value in GBP: USDT free + BTC free converted to USDT.
+
+        Returns:
+          total_gbp      — combined GBP value of all BTC and USDT held
+          usdt_free      — USDT free balance
+          btc_free       — BTC free balance
+          btc_price_usdt — BTC/USDT mid-price used for BTC valuation
+        """
+        balance    = self._call(self._ex.fetch_balance)
+        usdt_free  = float((balance.get("USDT") or {}).get("free") or 0)
+        btc_free   = float((balance.get("BTC")  or {}).get("free") or 0)
+
+        btc_price = 0.0
+        try:
+            ticker    = self._call(self._ex.fetch_ticker, "BTC/USDT")
+            btc_price = float(ticker.get("last") or ticker.get("close") or 0)
+        except Exception:
+            pass
+
+        btc_in_usdt = btc_free * btc_price if btc_price > 0 else 0.0
+        total_usdt  = usdt_free + btc_in_usdt
+        total_gbp   = total_usdt / gbp_usd_rate if gbp_usd_rate else 0.0
+
+        return {
+            "total_gbp":      round(total_gbp, 2),
+            "usdt_free":      round(usdt_free, 4),
+            "btc_free":       round(btc_free, 8),
+            "btc_price_usdt": round(btc_price, 2),
+        }
+
     # ------------------------------------------------------------------ #
     #  Market data                                                         #
     # ------------------------------------------------------------------ #
@@ -113,6 +145,32 @@ class CDXClient:
             "high_24h": float(t.get("high") or 0),
             "low_24h":  float(t.get("low") or 0),
             "volume":   float(t.get("baseVolume") or 0),
+        }
+
+    def get_order_book(self, instrument: str = "BTC_USDT", depth: int = 5) -> dict:
+        """
+        Return the top-N levels of the order book.
+
+        Returns:
+          best_bid  — highest bid price
+          best_ask  — lowest ask price
+          mid_price — (best_bid + best_ask) / 2
+          spread    — best_ask - best_bid
+          bids      — list of [price, qty] pairs (descending)
+          asks      — list of [price, qty] pairs (ascending)
+        """
+        ob = self._call(self._ex.fetch_order_book, self._sym(instrument), depth)
+        bids = ob.get("bids") or []
+        asks = ob.get("asks") or []
+        best_bid = float(bids[0][0]) if bids else 0.0
+        best_ask = float(asks[0][0]) if asks else 0.0
+        return {
+            "best_bid":  best_bid,
+            "best_ask":  best_ask,
+            "mid_price": (best_bid + best_ask) / 2 if best_bid and best_ask else 0.0,
+            "spread":    best_ask - best_bid,
+            "bids":      [[float(p), float(q)] for p, q in bids],
+            "asks":      [[float(p), float(q)] for p, q in asks],
         }
 
     def get_candlesticks(
@@ -179,8 +237,11 @@ class CDXClient:
             for o in open_orders:
                 try:
                     self._call(self._ex.cancel_order, str(o["id"]), self._sym(instrument))
-                except Exception:
-                    pass
+                except Exception as e:
+                    # Log but continue — caller must NOT clear grid_state for this order
+                    # since it may still be live on the exchange.
+                    print(f"[cdx] WARNING: failed to cancel order {o.get('id')}: {e} "
+                          f"— order may remain open, audit will catch it next run")
 
     def get_open_orders(self, instrument: str) -> list[dict]:
         """Return all currently open orders for an instrument."""

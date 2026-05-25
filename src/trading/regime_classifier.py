@@ -26,6 +26,7 @@ import json
 import math
 import os
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -37,8 +38,14 @@ sys.path.insert(0, str(ROOT / "src"))
 from trading.cdx_client import CDXClient
 
 
-DATA_FILE  = ROOT / "data" / "regime.json"
-INSTRUMENT = "BTC_USDT"
+DATA_FILE         = ROOT / "data" / "regime.json"
+TREND_PAUSE_FLAG  = ROOT / "data" / "trend_pause.flag"
+INSTRUMENT        = "BTC_USDT"
+
+# Minimum HMM confidence required before activating the trend pause.
+# At lower confidence the signal is unreliable and pausing would forfeit
+# good ranging fills unnecessarily.
+TREND_PAUSE_CONFIDENCE = 0.70
 
 
 # ------------------------------------------------------------------ #
@@ -174,32 +181,37 @@ def classify_rules(atr: float, bbw: float, candles: list[dict]) -> str:
 # ------------------------------------------------------------------ #
 
 REGIME_PARAMS = {
+    # ranging: optimal for small capital — 1.0% spacing gives 0.50% net vs 0.30% at 0.8%
+    # asymmetric 4:2 buy/sell skew; trend pause prevents operation during trending phases
     "ranging": {
-        "spacing_pct": 0.8,
+        "spacing_pct": 1.0,
         "range_pct":   5.0,
-        "levels":      10,
+        "levels":      6,
         "capital_pct": 0.70,
         "kill_pct":    0.10,
     },
+    # trending_up: grid continues only when HMM confidence < 0.70; wide spacing to ride swings
     "trending_up": {
-        "spacing_pct": 1.2,
+        "spacing_pct": 1.4,
         "range_pct":   7.0,
-        "levels":      8,
-        "capital_pct": 0.60,
+        "levels":      6,
+        "capital_pct": 0.55,
         "kill_pct":    0.10,
     },
+    # trending_dn: reduced capital, tighter kill; grid runs only when confidence < 0.70
     "trending_dn": {
-        "spacing_pct": 1.0,
+        "spacing_pct": 1.2,
         "range_pct":   5.0,
-        "levels":      8,
-        "capital_pct": 0.55,
+        "levels":      6,
+        "capital_pct": 0.50,
         "kill_pct":    0.08,
     },
+    # volatile: widest spacing to survive large swings without recentering
     "volatile": {
-        "spacing_pct": 1.4,
+        "spacing_pct": 1.6,
         "range_pct":   8.0,
-        "levels":      10,
-        "capital_pct": 0.65,
+        "levels":      6,
+        "capital_pct": 0.60,
         "kill_pct":    0.10,
     },
 }
@@ -235,30 +247,61 @@ def run() -> None:
         regime = classify_rules(atr, bbw, candles)
         print(f"[regime] Rule-based fallback: {regime}")
 
-    # Cross-check: if HMM confidence is low (<0.6), blend with rule-based
+    # Cross-check: if HMM confidence is low (<0.6), blend with rule-based.
+    # When rule-based overrides, treat confidence as 0.5 (rule-based certainty proxy)
+    # so grid_trader's apply_regime_params() knows to distrust the HMM value.
     if hmm_available and hmm_confidence < 0.6:
         rule_regime = classify_rules(atr, bbw, candles)
         if rule_regime != regime:
             print(f"[regime] Low HMM confidence — rule-based ({rule_regime}) overrides HMM ({regime})")
-            regime = rule_regime
+            regime         = rule_regime
+            hmm_confidence = 0.5   # synthetic: rule-based is more certain than low-conf HMM
 
     params = REGIME_PARAMS[regime]
 
-    DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
-    DATA_FILE.write_text(
-        json.dumps(
-            {
-                "regime":         regime,
-                "hmm_available":  hmm_available,
-                "hmm_confidence": round(hmm_confidence, 3),
-                "atr":            round(atr, 2),
-                "bbw_pct":        round(bbw * 100, 2),
-                "recommended":    params,
-                "updated_at":     datetime.now(timezone.utc).isoformat(),
-            },
-            indent=2,
-        )
+    # ── Trend pause flag ─────────────────────────────────────────────────────
+    # When the regime is a confirmed strong trend, set a flag that tells the
+    # grid trader to stand aside entirely — avoiding recenter fee drag.
+    # The flag is cleared as soon as the regime reverts to ranging or volatile.
+    is_strong_trend = (
+        regime in ("trending_up", "trending_dn")
+        and hmm_confidence >= TREND_PAUSE_CONFIDENCE
     )
+    if is_strong_trend:
+        TREND_PAUSE_FLAG.parent.mkdir(parents=True, exist_ok=True)
+        TREND_PAUSE_FLAG.touch()
+        print(f"[regime] Trend pause ACTIVATED ({regime} conf={hmm_confidence:.2f}) "
+              f"— grid_trader will stand aside until regime reverts")
+    else:
+        TREND_PAUSE_FLAG.unlink(missing_ok=True)
+        if regime in ("trending_up", "trending_dn"):
+            print(f"[regime] Trend detected but confidence too low ({hmm_confidence:.2f} < "
+                  f"{TREND_PAUSE_CONFIDENCE}) — grid continues")
+
+    payload = json.dumps(
+        {
+            "regime":         regime,
+            "hmm_available":  hmm_available,
+            "hmm_confidence": round(hmm_confidence, 3),
+            "atr":            round(atr, 2),
+            "bbw_pct":        round(bbw * 100, 2),
+            "recommended":    params,
+            "updated_at":     datetime.now(timezone.utc).isoformat(),
+        },
+        indent=2,
+    )
+    DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=DATA_FILE.parent, prefix=".tmp_")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(payload)
+        os.replace(tmp, DATA_FILE)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     print(
         f"[regime] {regime} | ATR={atr:.0f} | BBW={bbw*100:.1f}% | "
         f"HMM={'✓' if hmm_available else '✗'} conf={hmm_confidence:.2f} | "

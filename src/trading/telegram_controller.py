@@ -2,7 +2,7 @@
 Telegram interactive controller — Skill 3 (aiogram v3).
 
 Turns the one-way notification system into a two-way control panel.
-Runs as a persistent async process (separate from the 5-min cron job).
+Runs as a persistent async process (separate from the 1-min cron job).
 
 Commands
 --------
@@ -40,13 +40,14 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
 # Paths
-CONFIG_FILE    = ROOT / "config" / "grid_params.json"
-REGIME_FILE    = ROOT / "data"   / "regime.json"
-STATE_FILE     = ROOT / "data"   / "weekly_state.json"
-HEARTBEAT_FILE = ROOT / "data"   / "last_heartbeat.json"
-PAUSE_FLAG     = ROOT / "data"   / "paused.flag"
-RECENTER_FLAG  = ROOT / "data"   / "force_recenter.flag"
-CANDIDATES_FILE = ROOT / "data"  / "optuna_candidates.json"
+CONFIG_FILE      = ROOT / "config" / "grid_params.json"
+REGIME_FILE      = ROOT / "data"   / "regime.json"
+STATE_FILE       = ROOT / "data"   / "weekly_state.json"
+HEARTBEAT_FILE   = ROOT / "data"   / "last_heartbeat.json"
+PAUSE_FLAG       = ROOT / "data"   / "paused.flag"
+RECENTER_FLAG    = ROOT / "data"   / "force_recenter.flag"
+TREND_PAUSE_FLAG = ROOT / "data"   / "trend_pause.flag"   # set by regime_classifier
+CANDIDATES_FILE  = ROOT / "data"  / "optuna_candidates.json"
 
 
 # ------------------------------------------------------------------ #
@@ -78,21 +79,33 @@ def _build_status() -> str:
     regime = _read_json(REGIME_FILE)
     hb     = _read_json(HEARTBEAT_FILE)
     cfg    = _read_json(CONFIG_FILE)
-    paused = PAUSE_FLAG.exists()
+    paused       = PAUSE_FLAG.exists()
+    trend_paused = TREND_PAUSE_FLAG.exists()
 
     kill   = state.get("kill_switch_on", False)
     pnl    = state.get("weekly_pnl_gbp", 0.0)
     trades = state.get("trades_this_week", 0)
     price  = hb.get("price", 0)
+    cap    = cfg.get("total_capital", 0)
+
+    if paused:
+        status_icon = "⏸ PAUSED (manual)"
+    elif trend_paused:
+        status_icon = "📉 TREND PAUSE (auto — strong trend detected)"
+    elif kill:
+        status_icon = "🛑 KILL SWITCH ON"
+    else:
+        status_icon = "🟢 Running"
 
     lines = [
         f"📊 *Grid Bot Status*",
         f"",
-        f"{'🔴 PAUSED' if paused else ('🛑 KILL SWITCH ON' if kill else '🟢 Running')}",
+        f"{status_icon}",
         f"",
         f"💰 Week P&L: *{'%+.2f' % pnl} GBP*",
         f"📈 Trades this week: {trades}",
         f"₿ BTC price: ${price:,.0f}" if price else "",
+        f"💼 Portfolio: £{cap:.2f}" if cap else "",
         f"",
         f"⚙️ Grid config:",
         f"  Regime: {regime.get('regime', 'unknown')} "
@@ -156,13 +169,14 @@ def _register_handlers(dp, allowed_chat_id: str):
             return
         await msg.answer(
             "🤖 *BTCTradeBot Controller*\n\n"
-            "/status   — live P\\&L, regime, heartbeat\n"
-            "/params   — current grid parameters\n"
-            "/pause    — pause the grid bot\n"
-            "/resume   — resume the grid bot\n"
-            "/recenter — force grid recentre on next run\n"
-            "/kills    — kill switch status\n"
-            "/optuna   — last Optuna candidates",
+            "/status      — live P\\&L, regime, heartbeat\n"
+            "/params      — current grid parameters\n"
+            "/pause       — pause the grid bot manually\n"
+            "/resume      — resume manual pause\n"
+            "/trendresume — override trend pause (force grid on)\n"
+            "/recenter    — force grid recentre on next run\n"
+            "/kills       — kill switch status\n"
+            "/optuna      — last Optuna candidates",
             reply_markup=_main_keyboard(),
         )
 
@@ -202,7 +216,7 @@ def _register_handlers(dp, allowed_chat_id: str):
             return
         if PAUSE_FLAG.exists():
             PAUSE_FLAG.unlink()
-            await msg.answer("▶️ *Bot resumed.* It will trade on the next 5-minute cron tick.")
+            await msg.answer("▶️ *Bot resumed.* It will trade on the next 1-minute cron tick.")
         else:
             await msg.answer("ℹ️ Bot was not paused.")
 
@@ -215,7 +229,7 @@ def _register_handlers(dp, allowed_chat_id: str):
         await msg.answer(
             "🔄 *Force recentre scheduled.*\n"
             "The grid will cancel all orders and rebuild around the current "
-            "BTC price on the next 5-minute run."
+            "BTC price on the next 1-minute run."
         )
 
     @router.message(Command("kills"))
@@ -234,6 +248,21 @@ def _register_handlers(dp, allowed_chat_id: str):
             f"Triggered at: {trigger}"
         )
         await msg.answer(text)
+
+    @router.message(Command("trendresume"))
+    async def cmd_trendresume(msg: Message):
+        if not _allowed(msg):
+            return
+        if TREND_PAUSE_FLAG.exists():
+            TREND_PAUSE_FLAG.unlink()
+            await msg.answer(
+                "▶️ *Trend pause overridden.*\n"
+                "Grid will resume on the next 1-minute cron tick.\n"
+                "_Note: the regime classifier may reinstate the pause in ≤4 hours "
+                "if the trend persists._"
+            )
+        else:
+            await msg.answer("ℹ️ No trend pause was active.")
 
     @router.message(Command("optuna"))
     async def cmd_optuna(msg: Message):

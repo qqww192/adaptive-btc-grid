@@ -18,6 +18,7 @@ Design principles:
 import hashlib
 import json
 import os
+import tempfile
 import time
 from pathlib import Path
 from typing import Optional
@@ -86,14 +87,29 @@ def _cache_get(key: str) -> Optional[str]:
     return None
 
 
+def _atomic_write(path: Path, content: str) -> None:
+    """Write content atomically: temp file in same dir then os.replace()."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".tmp_")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def _cache_set(key: str, value: str) -> None:
     try:
         cache = json.loads(CACHE_FILE.read_text()) if CACHE_FILE.exists() else {}
         cache[key] = {"value": value, "ts": time.time()}
         cache = {k: v for k, v in cache.items()
                  if time.time() - v.get("ts", 0) < CACHE_TTL * 2}
-        CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        CACHE_FILE.write_text(json.dumps(cache))
+        _atomic_write(CACHE_FILE, json.dumps(cache))
     except Exception:
         pass
 
@@ -118,7 +134,7 @@ def ask_recenter(
     closes = [c["close"] for c in recent_candles[-6:]] if len(recent_candles) >= 6 else []
     price_trail = " → ".join(f"${p:,.0f}" for p in closes) if closes else f"${current_price:,.0f}"
 
-    key = _cache_key("recenter", f"{current_price:.0f}", f"{calibration_price:.0f}")
+    key = _cache_key("recenter", f"{current_price:.0f}", f"{calibration_price:.0f}", regime)
     cached = _cache_get(key)
     if cached is not None:
         decision = cached == "RECENTER"
@@ -135,8 +151,11 @@ def ask_recenter(
 
     response = _call_ai(prompt, max_tokens=5)
     if response is None:
-        print("[ai] Recenter fallback → RECENTER (AI unavailable)")
-        return True
+        # HOLD is the safe default — the existing grid is already placed at zero
+        # additional cost. Recentering on AI failure burns fees unnecessarily.
+        # The 20-minute forced-recenter timeout in grid_trader is the safety net.
+        print("[ai] Recenter fallback → HOLD (AI unavailable)")
+        return False
 
     decision = "recenter" in response.lower()
     result   = "RECENTER" if decision else "HOLD"
@@ -177,18 +196,21 @@ def ask_regime(
     prompt = (
         f"BTC/USDT last 8 candles: range={range_pct:.1f}%, net move={net_move_pct:+.1f}%. "
         f"HMM says '{hmm_regime}' but confidence is only {hmm_confidence:.0%}. "
-        f"Classify the market regime. Reply with one word: RANGING, TRENDING, or VOLATILE."
+        f"Classify the market regime. "
+        f"Reply with one word: RANGING, TRENDING_UP, TRENDING_DOWN, or VOLATILE."
     )
 
-    response = _call_ai(prompt, max_tokens=5)
+    response = _call_ai(prompt, max_tokens=8)
     if response is None:
         print(f"[ai] Regime fallback → {hmm_regime} (AI unavailable)")
         return hmm_regime
 
     r = response.lower()
-    if   "trend"  in r: regime = "trending"
-    elif "volat"  in r: regime = "volatile"
-    else:               regime = "ranging"
+    if   "trending_down" in r or "trending_dn" in r: regime = "trending_dn"
+    elif "trending_up"   in r or ("trend" in r and net_move_pct >= 0): regime = "trending_up"
+    elif "trend"         in r and net_move_pct < 0: regime = "trending_dn"
+    elif "volat"         in r: regime = "volatile"
+    else:                      regime = "ranging"
 
     if regime != hmm_regime:
         print(f"[ai] Regime override: {hmm_regime} → {regime}  "

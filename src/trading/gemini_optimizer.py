@@ -25,6 +25,7 @@ import json
 import math
 import os
 import sys
+import tempfile
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -35,6 +36,22 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from trading.trade_logger  import read_all, read_since
 from trading.cdx_client    import CDXClient, CDXError
+
+
+def _atomic_write(path: Path, content: str) -> None:
+    """Write content atomically: temp file in same dir then os.replace()."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".tmp_")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 CONFIG_FILE      = ROOT / "config" / "grid_params.json"
 REGIME_FILE      = ROOT / "data"   / "regime.json"
@@ -92,12 +109,14 @@ def compute_metrics(trades: list[dict]) -> dict:
             "note": "no_sells_this_week",
         }
 
+    # Include BUY-side fees (recorded as negative net_gbp) so P&L reflects true round-trip cost.
+    buy_fees_gbp = sum(abs(t["net_gbp"]) for t in trades if t["side"] == "BUY")
     nets     = [t["net_gbp"] for t in sells]
     wins     = [n for n in nets if n > 0]
     losses   = [n for n in nets if n <= 0]
     gross    = sum(t["gross_gbp"] for t in trades)
     fees_gbp = sum(t["fee_usdt"]  for t in trades) / float(os.environ.get("GBP_USD_RATE", "1.27"))
-    net_tot  = sum(nets)
+    net_tot  = sum(nets) - buy_fees_gbp
     fee_drag = (fees_gbp / gross * 100) if gross else 0
 
     mean_ret = net_tot / len(nets) if nets else 0
@@ -126,8 +145,17 @@ def _load_optuna_candidates() -> list[dict]:
     if not CANDIDATES_FILE.exists():
         return []
     try:
-        data = json.loads(CANDIDATES_FILE.read_text())
+        data       = json.loads(CANDIDATES_FILE.read_text())
         candidates = data.get("candidates", [])
+        generated  = data.get("generated_at", "")
+        if generated:
+            age_hours = (
+                datetime.now(timezone.utc)
+                - datetime.fromisoformat(generated)
+            ).total_seconds() / 3600
+            if age_hours > 36:
+                print(f"[optimiser] Optuna candidates are {age_hours:.0f}h old — ignoring stale data")
+                return []
         print(f"[optimiser] Loaded {len(candidates)} Optuna candidates from Saturday sweep")
         return candidates
     except Exception:
@@ -345,7 +373,7 @@ def simulate_return(candles: list[dict], config: dict) -> float:
     - Expresses the result as % of total deployed capital
     """
     spacing_pct     = config["spacing_pct"] / 100
-    fee_pct         = 0.0025   # 0.25% maker per leg
+    fee_pct         = 0.0025   # 0.25% maker fee per leg (crypto.com Exchange VIP 0 / default tier)
     levels          = config["levels"]
     capital_usdt    = (
         config.get("total_capital", 150)
@@ -373,9 +401,11 @@ def simulate_return(candles: list[dict], config: dict) -> float:
             gross           = round_trips * per_level_usdt * spacing_pct
             fees            = round_trips * per_level_usdt * fee_pct * 2
         else:
-            # Trending day: assume no completed round trips; only recalibration drag
-            # (grid recentres every 3% move = fee drag per recalibration)
-            recal_count = math.floor(daily_move_pct / 0.03)
+            # Trending day: assume no completed round trips; only recalibration drag.
+            # Use the actual range_pct threshold (not a hardcoded 3%) so the simulation
+            # reflects how often the real bot actually recenters.
+            recenter_threshold = config.get("range_pct", 5.0) / 100
+            recal_count = math.floor(daily_move_pct / recenter_threshold) if recenter_threshold else 0
             gross = 0.0
             fees  = recal_count * per_level_usdt * fee_pct * 2
 
@@ -393,10 +423,17 @@ def walk_forward_confirms(
 ) -> tuple[bool, float, float]:
     """
     Return (accepted, current_return, proposed_return).
-    Accept if proposed return > current return.
+    Accept if proposed return > current return AND proposed return > 0.
+    Both-negative: log a warning but accept if proposed is clearly better (>0.1pp).
     """
     curr_ret = simulate_return(candles, current)
     prop_ret = simulate_return(candles, proposed)
+    if prop_ret <= 0 and curr_ret <= 0:
+        # Both regimes look unprofitable — accept only if proposed is meaningfully better
+        accepted = (prop_ret - curr_ret) > 0.10
+        print(f"[optimiser] Walk-forward: both configs negative (curr={curr_ret:.2f}% prop={prop_ret:.2f}%) "
+              f"— {'accepting marginal improvement' if accepted else 'keeping current (not enough improvement)'}")
+        return accepted, curr_ret, prop_ret
     return prop_ret > curr_ret, curr_ret, prop_ret
 
 
@@ -447,7 +484,7 @@ def run() -> None:
     candles = cdx.get_candlesticks("BTC_USDT", timeframe="1D", count=30)
     try:
         ticker    = cdx.get_ticker("BTC_USDT")
-        btc_price = float(ticker.get("a", ticker.get("last", 0)))
+        btc_price = float(ticker.get("ask", ticker.get("last", 0)))
     except Exception:
         btc_price = 0.0
 
@@ -499,8 +536,11 @@ def run() -> None:
     accepted, curr_ret, prop_ret = walk_forward_confirms(candles, current_config, proposed)
 
     if accepted:
-        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        CONFIG_FILE.write_text(json.dumps(proposed, indent=2))
+        # Merge proposed into current config so keys the AI didn't touch
+        # (e.g. _notes, instrument) are preserved.
+        merged = dict(current_config)
+        merged.update(proposed)
+        _atomic_write(CONFIG_FILE, json.dumps(merged, indent=2))
         action  = "✅ Parameters updated"
         details = (
             f"Old spacing: {current_config.get('spacing_pct')}% → New: {proposed.get('spacing_pct')}%\n"

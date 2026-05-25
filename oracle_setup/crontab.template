@@ -13,8 +13,8 @@ PYTHONPATH={BOT_DIR}
 # ── Load .env before every run ──────────────────────────────────────
 # We source the .env inline so secrets are never written to the crontab.
 
-# ── Every 2 min: fill check + kill switch ──────────────────────────
-*/2 * * * * cd {BOT_DIR} && set -a && source .env && set +a && timeout 90s {PYTHON} src/trading/grid_trader.py >> {LOG_DIR}/grid_trader.log 2>&1
+# ── Every 1 min: fill check + kill switch ──────────────────────────
+*/1 * * * * cd {BOT_DIR} && set -a && source .env && set +a && timeout 90s {PYTHON} src/trading/grid_trader.py >> {LOG_DIR}/grid_trader.log 2>&1
 
 # ── Every 4 hours: regime classification (HMM + rule-based fallback) ─
 0 */4 * * * cd {BOT_DIR} && set -a && source .env && set +a && {PYTHON} src/trading/regime_classifier.py >> {LOG_DIR}/regime.log 2>&1
@@ -36,5 +36,4 @@ PYTHONPATH={BOT_DIR}
 0 22 * * 0 for f in {LOG_DIR}/*.log; do tail -n 500 "$f" > "$f.tmp" && mv "$f.tmp" "$f"; done
 
 # ── Telegram controller (Skill 3) — start on reboot ─────────────────
-# Uncomment after: pip install aiogram
-# @reboot cd {BOT_DIR} && set -a && source .env && set +a && nohup {PYTHON} src/trading/telegram_controller.py >> {LOG_DIR}/controller.log 2>&1 &
+@reboot cd {BOT_DIR} && set -a && source .env && set +a && nohup {PYTHON} src/trading/telegram_controller.py >> {LOG_DIR}/controller.log 2>&1 &

@@ -103,8 +103,8 @@ def _make_env(candles: list[dict], config: dict):
         def reset(self, *, seed=None, options=None):
             super().reset(seed=seed)
             self.step_idx    = 0
-            self.spacing     = float(self.base_config.get("spacing_pct", 0.8))
-            self.levels      = int(self.base_config.get("levels", 10))
+            self.spacing     = float(self.base_config.get("spacing_pct", 1.0))
+            self.levels      = int(self.base_config.get("levels", 6))
             self.capital_pct = float(self.base_config.get("capital_pct", 0.70))
             self.cumulative_pnl   = 0.0
             self.peak_pnl         = 0.0

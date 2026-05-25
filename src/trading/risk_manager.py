@@ -26,14 +26,40 @@ Skill 4: Dynamic capital sizing (Riskfolio-Lib / CDaR)
 
 import json
 import os
+import tempfile
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
 
-ROOT       = Path(__file__).resolve().parents[2]
-STATE_FILE = ROOT / "data" / "weekly_state.json"
+ROOT        = Path(__file__).resolve().parents[2]
+STATE_FILE  = ROOT / "data"   / "weekly_state.json"
+CONFIG_FILE = ROOT / "config" / "grid_params.json"
 
-TOTAL_CAPITAL_GBP = float(os.environ.get("TOTAL_CAPITAL_GBP", "150"))
+_TOTAL_CAPITAL_GBP_DEFAULT = float(os.environ.get("TOTAL_CAPITAL_GBP", "150"))
+
+
+def _get_total_capital() -> float:
+    """Read total_capital from config first, fall back to env var.
+    Keeps kill threshold in sync when capital is topped up in config."""
+    try:
+        cfg = json.loads(CONFIG_FILE.read_text())
+        return float(cfg.get("total_capital", _TOTAL_CAPITAL_GBP_DEFAULT))
+    except Exception:
+        return _TOTAL_CAPITAL_GBP_DEFAULT
+
+
+# Module-level alias kept for backward compat with any direct references.
+TOTAL_CAPITAL_GBP = _TOTAL_CAPITAL_GBP_DEFAULT
+
+
+def _get_kill_pct() -> float:
+    """Read kill_pct from config file first, fall back to env var.
+    This ensures the Sunday AI optimizer's regime-aware kill_pct changes take effect."""
+    try:
+        cfg = json.loads(CONFIG_FILE.read_text())
+        return float(cfg.get("kill_pct", os.environ.get("KILL_SWITCH_PCT", "0.10")))
+    except Exception:
+        return float(os.environ.get("KILL_SWITCH_PCT", "0.10"))
 
 
 # ------------------------------------------------------------------ #
@@ -47,18 +73,41 @@ def _monday_utc() -> datetime:
     return (now - delta).replace(hour=0, minute=0, second=0, microsecond=0)
 
 
+def _atomic_write(path: Path, content: str) -> None:
+    """Write content atomically: temp file in same dir then os.replace()."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".tmp_")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def _load() -> dict:
     if STATE_FILE.exists():
         try:
             return json.loads(STATE_FILE.read_text())
         except json.JSONDecodeError:
-            pass
+            # Corrupted file — fail safe: force kill switch ON so the bot does
+            # not trade through a week where the threshold may already be breached.
+            _send_telegram(
+                "🚨 *CRITICAL: weekly_state.json is corrupted*\n"
+                "Kill switch forced ACTIVE as a safety measure.\n"
+                "Delete data/weekly_state.json to reset (will lose weekly P&L counter)."
+            )
+            print("[risk] CRITICAL: weekly_state.json corrupted — kill switch forced ON")
+            return {"kill_switch_on": True, "corrupted": True}
     return {}
 
 
 def _save(state: dict) -> None:
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state, indent=2))
+    _atomic_write(STATE_FILE, json.dumps(state, indent=2))
 
 
 def _reset_if_new_week(state: dict) -> dict:
@@ -70,6 +119,8 @@ def _reset_if_new_week(state: dict) -> dict:
             "kill_switch_on":   False,
             "kill_trigger_at":  None,
             "trades_this_week": 0,
+            "warning_sent":     False,
+            "ai_reduce_cap":    False,
         }
         _save(state)
     return state
@@ -94,8 +145,8 @@ def record_trade(net_pnl_gbp: float) -> dict:
     state["weekly_pnl_gbp"]   += net_pnl_gbp
     state["trades_this_week"] += 1
 
-    kill_pct       = float(os.environ.get("KILL_SWITCH_PCT", "0.10"))
-    kill_threshold = -(TOTAL_CAPITAL_GBP * kill_pct)
+    kill_pct       = _get_kill_pct()
+    kill_threshold = -(_get_total_capital() * kill_pct)
 
     if state["weekly_pnl_gbp"] <= kill_threshold and not state["kill_switch_on"]:
         state["kill_switch_on"]  = True
@@ -111,18 +162,23 @@ def record_trade(net_pnl_gbp: float) -> dict:
 def record_warning(state: dict) -> None:
     """Send a Telegram warning when P&L hits the 50%-of-kill threshold.
     Also asks AI whether to reduce capital deployment."""
+    # Always read fresh state — the passed-in state may be stale if multiple
+    # fills were processed in the same run before this is called.
+    state = get_state()
     if state.get("warning_sent"):
         return
-    kill_pct       = float(os.environ.get("KILL_SWITCH_PCT", "0.10"))
-    kill_abs       = TOTAL_CAPITAL_GBP * kill_pct
+    kill_pct       = _get_kill_pct()
+    kill_abs       = _get_total_capital() * kill_pct
     warning_thresh = -(kill_abs * 0.5)
     if state["weekly_pnl_gbp"] <= warning_thresh:
         # Priority 4: ask AI whether to reduce capital
         ai_decision = "hold"
         try:
-            from trading.trade_logger import read_all
+            from trading.trade_logger import read_since
             from trading.ai_advisor   import ask_kill_switch_guardian
-            sells       = [t for t in read_all() if t.get("side") == "SELL"]
+            from datetime import timedelta
+            since_7d    = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+            sells       = [t for t in read_since(since_7d) if t.get("side") == "SELL"]
             net_returns = [t["net_gbp"] for t in sells[-20:]]
             ai_decision = ask_kill_switch_guardian(
                 weekly_pnl         = state["weekly_pnl_gbp"],
@@ -204,9 +260,11 @@ def get_dynamic_capital_pct(base_capital_pct: float = 0.70) -> float:
     Guaranteed to stay within [0.40, base_capital_pct].
     """
     try:
-        from trading.trade_logger import read_all
-        sells    = [t for t in read_all() if t.get("side") == "SELL"]
-        net_rets = [t["net_gbp"] for t in sells[-30:]]
+        from trading.trade_logger import read_since
+        from datetime import timedelta
+        since_30d = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        sells     = [t for t in read_since(since_30d) if t.get("side") == "SELL"]
+        net_rets  = [t["net_gbp"] for t in sells[-30:]]
     except Exception:
         return base_capital_pct
 
@@ -217,8 +275,8 @@ def get_dynamic_capital_pct(base_capital_pct: float = 0.70) -> float:
     if cdar is None:
         cdar = _compute_cdar(net_rets)
 
-    kill_pct = float(os.environ.get("KILL_SWITCH_PCT", "0.10"))
-    kill_abs = TOTAL_CAPITAL_GBP * kill_pct
+    kill_pct = _get_kill_pct()
+    kill_abs = _get_total_capital() * kill_pct
     ratio    = cdar / kill_abs if kill_abs else 0.0
 
     if ratio > 0.80:
@@ -249,11 +307,11 @@ def get_dynamic_capital_pct(base_capital_pct: float = 0.70) -> float:
 # ------------------------------------------------------------------ #
 
 def _send_kill_alert(state: dict) -> None:
-    kill_pct = float(os.environ.get("KILL_SWITCH_PCT", "0.10"))
+    kill_pct = _get_kill_pct()
     _send_telegram(
         f"🛑 *Kill switch triggered*\n"
         f"Weekly P&L reached £{state['weekly_pnl_gbp']:.2f} "
-        f"(limit: -£{TOTAL_CAPITAL_GBP * kill_pct:.2f})\n"
+        f"(limit: -£{_get_total_capital() * kill_pct:.2f})\n"
         f"Trading paused until Monday 00:00 UTC.\n"
         f"Trades this week: {state['trades_this_week']}"
     )

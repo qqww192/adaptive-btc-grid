@@ -4,10 +4,11 @@ Grid strategy backtester — Skill 7 (hftbacktest-inspired).
 A purpose-built grid trading simulator that models:
   - Individual order placement and fill sequencing
   - POST_ONLY maker fee (0.25% per leg)
-  - Grid recentring every time price moves > 3% from calibration
+  - Grid recentring when price moves > config.range_pct from calibration
   - Capital reservation (capital_pct ≤ 0.80)
-  - Per-level buy-price tracking for accurate SELL profit calculation
-  - Regime transitions (reads regime thresholds per candle)
+  - Fixed-level grid topology matching the live bot:
+      · After a BUY fills: re-place same BUY; track fill price in FIFO queue
+      · After a SELL fills: re-place same SELL; P&L paired with oldest BUY
   - Daily P&L, weekly Sharpe, max drawdown, win rate
 
 Unlike the simple simulate_return() in gemini_optimizer.py this backtester
@@ -20,7 +21,7 @@ Usage
   python3 src/backtesting/grid_backtest.py
 
   # Custom params:
-  python3 src/backtesting/grid_backtest.py --spacing 0.9 --levels 8 --capital 0.65 --days 90
+  python3 src/backtesting/grid_backtest.py --spacing 1.0 --levels 6 --capital 0.65 --days 90
 
   # From gemini_optimizer:
   from backtesting.grid_backtest import run_backtest, BacktestResult
@@ -45,14 +46,14 @@ sys.path.insert(0, str(ROOT / "src"))
 
 MAKER_FEE   = 0.0025   # 0.25% per leg
 MIN_QTY_BTC = 0.0001
-RECENTER_THRESHOLD_PCT = 3.0  # recentre if price moves > 3% from calibration
+# RECENTER_THRESHOLD_PCT removed — use config.range_pct so backtest matches live bot
 
 
 @dataclass
 class GridConfig:
-    spacing_pct:   float = 0.8
-    range_pct:     float = 5.0
-    levels:        int   = 10
+    spacing_pct:   float = 1.0   # updated to match new default (was 0.8)
+    range_pct:     float = 5.0   # also used as the recenter threshold
+    levels:        int   = 6     # updated to match new default (was 10)
     capital_pct:   float = 0.70
     total_capital: float = 150.0
     gbp_usd_rate:  float = 1.27
@@ -140,17 +141,40 @@ class BacktestResult:
 #  Grid builder                                                        #
 # ------------------------------------------------------------------ #
 
-def _build_grid(center: float, config: GridConfig) -> list[Order]:
-    """Build a grid of limit orders around center price."""
-    spacing = config.spacing_pct / 100
-    half    = config.levels // 2
-    orders  = []
-    for i in range(config.levels):
-        offset = (i - half) * spacing
+_REGIME_GRID_SKEW = {
+    "trending_up": 0.60,
+    "trending_dn": 0.40,
+    "ranging":     0.50,
+    "volatile":    0.50,
+}
+
+
+def _build_grid(center: float, config: GridConfig, regime: str = "ranging") -> list[Order]:
+    """
+    Build a fixed-level grid matching the live bot's asymmetric layout.
+
+    Buy/sell split is regime-aware (trending_up skews 60/40, trending_dn
+    skews 40/60, others symmetric). This mirrors grid_trader.build_grid().
+    """
+    spacing  = config.spacing_pct / 100
+    levels   = config.levels
+    buy_frac = _REGIME_GRID_SKEW.get(regime, 0.50)
+    n_buys   = max(1, min(round(levels * buy_frac), levels - 1))
+    n_sells  = levels - n_buys
+    orders   = []
+
+    for i in range(n_buys):
+        offset = -(n_buys - i) * spacing
         price  = round(center * (1 + offset), 2)
-        side   = "SELL" if i >= half else "BUY"
         qty    = max(config.per_level_usdt / price, MIN_QTY_BTC)
-        orders.append(Order(level=i, side=side, price=price, qty=round(qty, 6)))
+        orders.append(Order(level=i, side="BUY", price=price, qty=round(qty, 6)))
+
+    for j in range(n_sells):
+        offset = j * spacing
+        price  = round(center * (1 + offset), 2)
+        qty    = max(config.per_level_usdt / price, MIN_QTY_BTC)
+        orders.append(Order(level=n_buys + j, side="SELL", price=price, qty=round(qty, 6)))
+
     return orders
 
 
@@ -159,79 +183,57 @@ def _build_grid(center: float, config: GridConfig) -> list[Order]:
 # ------------------------------------------------------------------ #
 
 def _simulate_candle_fills(
-    orders:     list[Order],
-    candle:     dict,
-    buy_prices: dict,   # level_idx → buy_price
-    config:     GridConfig,
-    result:     BacktestResult,
-) -> tuple[list[Order], dict]:
+    orders:    list[Order],
+    candle:    dict,
+    buy_queue: list,   # FIFO list of BUY fill prices (matches live bot's buy_prices_queue)
+    config:    GridConfig,
+    result:    BacktestResult,
+) -> tuple[list[Order], list]:
     """
-    For each order, decide if it would have filled during this candle's
-    OHLC range. Uses a simple sweep model:
-      - High of day reaches SELL orders above open
-      - Low of day reaches BUY orders below open
-    Returns (remaining_orders, updated_buy_prices).
+    Fixed-level fill simulation matching the live bot topology:
+      - BUY fills   → re-place same BUY at same price; push fill price onto FIFO queue
+      - SELL fills  → re-place same SELL at same price; pop oldest BUY for P&L
+
+    Fill condition (OHLC sweep model):
+      - BUY  fills if candle low  <= order price (price dipped to it)
+      - SELL fills if candle high >= order price (price rose to it)
     """
     high     = candle["high"]
     low      = candle["low"]
-    close    = candle["close"]
     gbp_rate = config.gbp_usd_rate
-
-    remaining  = []
-    day_pnl    = 0.0
-    day_fees   = 0.0
+    day_pnl  = 0.0
 
     for order in orders:
-        filled = False
-        if order.side == "BUY"  and order.price >= low:
-            filled = True
+        if order.side == "BUY" and order.price >= low:
+            fee_usdt = order.price * order.qty * MAKER_FEE
+            fee_gbp  = fee_usdt / gbp_rate
+            result.total_trades  += 1
+            result.total_fees_gbp += fee_gbp
+            buy_queue.append(order.price)
+            # Fixed-level: re-place the same BUY at the same price (no mutation needed —
+            # order object stays in the list unchanged for the next candle)
+
         elif order.side == "SELL" and order.price <= high:
-            filled = True
+            fee_usdt   = order.price * order.qty * MAKER_FEE
+            fee_gbp    = fee_usdt / gbp_rate
+            result.total_trades += 1
+            result.total_sells  += 1
 
-        if not filled:
-            remaining.append(order)
-            continue
-
-        fee_usdt  = order.price * order.qty * MAKER_FEE
-        fee_gbp   = fee_usdt / gbp_rate
-        result.total_trades += 1
-
-        if order.side == "BUY":
-            buy_prices[order.level] = order.price
-            day_fees    += fee_gbp
-            replacement  = Order(
-                level     = order.level,
-                side      = "SELL",
-                price     = round(order.price * (1 + config.spacing_pct / 100), 2),
-                qty       = order.qty,
-                buy_price = order.price,
-            )
-            remaining.append(replacement)
-
-        else:  # SELL
-            result.total_sells += 1
-            buy_px   = order.buy_price or buy_prices.get(order.level, order.price)
+            # Pair with oldest BUY (FIFO); fall back to a zero-cost basis if queue empty
+            buy_px = buy_queue.pop(0) if buy_queue else order.price
             gross_usdt = (order.price - buy_px) * order.qty
             gross_gbp  = gross_usdt / gbp_rate
             net_gbp    = gross_gbp - fee_gbp
+
             result.total_gross_gbp += gross_gbp
             result.total_fees_gbp  += fee_gbp
             result.total_net_gbp   += net_gbp
-            day_pnl  += net_gbp
-            day_fees += fee_gbp
+            day_pnl += net_gbp
             if net_gbp > 0:
                 result.wins += 1
-            buy_prices.pop(order.level, None)
-            replacement = Order(
-                level = order.level,
-                side  = "BUY",
-                price = round(order.price / (1 + config.spacing_pct / 100), 2),
-                qty   = order.qty,
-            )
-            remaining.append(replacement)
 
     result.daily_pnl.append(day_pnl)
-    return remaining, buy_prices
+    return orders, buy_queue   # orders unchanged (fixed-level)
 
 
 # ------------------------------------------------------------------ #
@@ -241,11 +243,13 @@ def _simulate_candle_fills(
 def run_backtest(
     candles: list[dict],
     config:  GridConfig,
+    regime:  str = "ranging",
     verbose: bool = False,
 ) -> BacktestResult:
     """
-    Step through each candle in order, maintaining grid state.
-    Recentres the grid whenever price moves > 3% from calibration.
+    Step through each candle in order, maintaining fixed-level grid state.
+    Recentres the grid when price moves > config.range_pct from calibration,
+    matching the live bot's recenter trigger exactly.
     """
     if len(candles) < 5:
         print("[backtest] Not enough candles.")
@@ -253,8 +257,8 @@ def run_backtest(
 
     result      = BacktestResult()
     calibration = candles[0]["close"]
-    orders      = _build_grid(calibration, config)
-    buy_prices: dict[int, float] = {}
+    orders      = _build_grid(calibration, config, regime)
+    buy_queue: list[float] = []   # FIFO BUY fill prices
 
     cumulative_pnl = 0.0
     peak_pnl       = 0.0
@@ -262,18 +266,18 @@ def run_backtest(
     for candle in candles:
         price = candle["close"]
 
-        # Recentre check
+        # Recentre when price breaks out of config.range_pct band (matches live bot)
         move_pct = abs(price - calibration) / calibration * 100
-        if move_pct > RECENTER_THRESHOLD_PCT:
+        if move_pct > config.range_pct:
             calibration = price
-            orders      = _build_grid(calibration, config)
-            buy_prices  = {}
+            orders      = _build_grid(calibration, config, regime)
+            buy_queue   = []   # pending BUYs lost on cancel-all, like the live bot
             result.recenter_count += 1
             if verbose:
                 print(f"[backtest] Recentre at ${price:,.0f} (move={move_pct:.1f}%)")
 
-        orders, buy_prices = _simulate_candle_fills(
-            orders, candle, buy_prices, config, result
+        orders, buy_queue = _simulate_candle_fills(
+            orders, candle, buy_queue, config, result
         )
 
         # Track max drawdown

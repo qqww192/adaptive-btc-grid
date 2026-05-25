@@ -104,6 +104,9 @@ def format_report() -> str:
 
     if not yesterday:
         lines.insert(4, f"_No trades yesterday._")
+        # Bot running but nothing filled — could be grid miscalibrated, spread too wide,
+        # or POST_ONLY orders silently rejected. Flag it explicitly.
+        lines.insert(5, f"⚠️ *Zero fills in 24h* — check grid positioning vs current BTC price")
 
     # Heartbeat staleness check — warn if bot hasn't run in >25 minutes
     heartbeat_file = ROOT / "data" / "last_heartbeat.json"
