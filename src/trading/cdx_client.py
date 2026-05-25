@@ -158,7 +158,7 @@ class CDXClient:
             side.lower(),
             quantity,
             price,
-            {"postOnly": True, "time_in_force": "GTC"},
+            {"postOnly": True},
         )
         order_id = str(order.get("id") or "").strip()
         if not order_id:
