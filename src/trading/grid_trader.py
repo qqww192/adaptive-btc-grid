@@ -784,6 +784,20 @@ def _check_stale_heartbeat() -> None:
 def _run() -> None:
     _check_stale_heartbeat()
 
+    # Stamp liveness immediately so the stale-heartbeat alert doesn't fire during
+    # intentional pauses (trend pause, kill switch, Telegram pause). Only a real
+    # crash or VM outage — where this line never runs — will trigger the alert.
+    try:
+        if HEARTBEAT_FILE.exists():
+            hb = json.loads(HEARTBEAT_FILE.read_text())
+        else:
+            hb = {}
+        hb["ts"] = datetime.now(timezone.utc).isoformat()
+        HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        HEARTBEAT_FILE.write_text(json.dumps(hb))
+    except Exception:
+        pass
+
     # 1. Kill switch check
     if is_kill_switch_active():
         print("[grid] Kill switch is active — bot paused until Monday. Exiting.")
