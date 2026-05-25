@@ -49,6 +49,11 @@ from trading.risk_manager import (
     record_warning,
 )
 from trading.trade_logger import append as log_trade
+from trading.ai_advisor import (
+    ask_recenter,
+    ask_regime,
+    send_monday_briefing,
+)
 
 # ------------------------------------------------------------------ #
 #  Paths                                                               #
@@ -61,6 +66,8 @@ HEARTBEAT_FILE  = ROOT / "data"   / "last_heartbeat.json"
 PAUSE_FLAG      = ROOT / "data"   / "paused.flag"        # Telegram controller
 RECENTER_FLAG   = ROOT / "data"   / "force_recenter.flag" # Telegram controller
 PROM_DIR        = ROOT / "data"   / "prometheus"
+
+RECENTER_CONFIRM_MINUTES = 20  # force recenter if AI keeps saying HOLD past this
 
 SAFE_BOUNDS = {
     "spacing_pct": (0.55, 3.0),
@@ -137,7 +144,7 @@ def acquire_lock() -> bool:
     """Return False if another run is already in progress."""
     if LOCK_FILE.exists():
         age = time.time() - LOCK_FILE.stat().st_mtime
-        if age < 240:
+        if age < 90:
             print("[grid] Lock file exists — previous run still active. Exiting.")
             return False
         print("[grid] Stale lock file removed.")
@@ -455,6 +462,20 @@ def _run() -> None:
         return
 
     price = ticker["price"]
+
+    # Priority 2: AI regime override when HMM confidence is low
+    recent_candles: list[dict] = []
+    if hmm_conf < HMM_CONFIDENCE_THRESHOLD:
+        try:
+            recent_candles = cdx.get_candlesticks(INSTRUMENT, "4h", count=8)
+            ai_regime      = ask_regime(recent_candles, regime, hmm_conf)
+            if ai_regime != regime:
+                regime              = ai_regime
+                regime_data["regime"] = regime
+                config              = apply_regime_params(config, regime_data)
+        except Exception as e:
+            print(f"[grid] AI regime fetch failed: {e} — using HMM regime")
+
     print(f"[grid] BTC/USDT: {price:,.2f} | Regime: {regime} (HMM conf={hmm_conf:.2f})")
 
     # 6. Detect fills from previous orders
@@ -467,13 +488,62 @@ def _run() -> None:
         save_grid_state(grid_state)
         return
 
-    # 7. Recalibrate if price has drifted or Telegram force-recentre was requested
+    # Priority 3: Monday morning AI briefing (fires once on weekly reset)
+    last_seen_week = grid_state.get("last_seen_week_start")
+    current_week   = risk_state.get("week_start", "")
+    if current_week and last_seen_week != current_week:
+        grid_state["last_seen_week_start"] = current_week
+        try:
+            send_monday_briefing(
+                last_week_pnl    = float(risk_state.get("weekly_pnl_gbp", 0)),
+                last_week_trades = int(risk_state.get("trades_this_week", 0)),
+                current_regime   = regime,
+                config           = config,
+            )
+        except Exception as e:
+            print(f"[grid] Monday briefing failed: {e}")
+
+    # 7. Priority 1: Smart recenter — AI confirms before acting
     force = RECENTER_FLAG.exists()
     if force:
         RECENTER_FLAG.unlink()
         print("[grid] Force-recentre flag set by Telegram — recentering now.")
-    if force or needs_recalibration(price, grid_state, config):
-        print(f"[grid] Grid needs recentering around {price:,.2f}")
+
+    do_recenter = False
+    if force:
+        do_recenter = True
+    elif needs_recalibration(price, grid_state, config):
+        # Lazy-fetch candles if not already loaded for regime override
+        if not recent_candles:
+            try:
+                recent_candles = cdx.get_candlesticks(INSTRUMENT, "4h", count=6)
+            except Exception:
+                recent_candles = []
+
+        if ask_recenter(price, grid_state.get("calibration_price", price), recent_candles, regime):
+            do_recenter = True
+            grid_state.pop("outside_since", None)
+        else:
+            # AI says hold — track how long we've been outside threshold
+            if "outside_since" not in grid_state:
+                grid_state["outside_since"] = datetime.now(timezone.utc).isoformat()
+                print(f"[grid] Smart recenter: AI says HOLD — watching for reversion")
+            else:
+                try:
+                    outside_dt  = datetime.fromisoformat(grid_state["outside_since"])
+                    elapsed_min = (datetime.now(timezone.utc) - outside_dt).total_seconds() / 60
+                    print(f"[grid] Smart recenter: AI holding ({elapsed_min:.0f}/{RECENTER_CONFIRM_MINUTES}min)")
+                    if elapsed_min >= RECENTER_CONFIRM_MINUTES:
+                        print(f"[grid] Smart recenter: timeout reached — forcing recenter")
+                        do_recenter = True
+                        grid_state.pop("outside_since", None)
+                except Exception:
+                    do_recenter = True
+    else:
+        grid_state.pop("outside_since", None)
+
+    if do_recenter:
+        print(f"[grid] Recentering grid around {price:,.2f}")
         cancel_all_and_clear(cdx, grid_state)
         grid_state["calibration_price"] = price
 

@@ -109,19 +109,43 @@ def record_trade(net_pnl_gbp: float) -> dict:
 
 
 def record_warning(state: dict) -> None:
-    """Send a Telegram warning when P&L hits the 50%-of-kill threshold."""
+    """Send a Telegram warning when P&L hits the 50%-of-kill threshold.
+    Also asks AI whether to reduce capital deployment."""
     if state.get("warning_sent"):
         return
     kill_pct       = float(os.environ.get("KILL_SWITCH_PCT", "0.10"))
-    warning_thresh = -(TOTAL_CAPITAL_GBP * kill_pct * 0.5)
+    kill_abs       = TOTAL_CAPITAL_GBP * kill_pct
+    warning_thresh = -(kill_abs * 0.5)
     if state["weekly_pnl_gbp"] <= warning_thresh:
+        # Priority 4: ask AI whether to reduce capital
+        ai_decision = "hold"
+        try:
+            from trading.trade_logger import read_all
+            from trading.ai_advisor   import ask_kill_switch_guardian
+            sells       = [t for t in read_all() if t.get("side") == "SELL"]
+            net_returns = [t["net_gbp"] for t in sells[-20:]]
+            ai_decision = ask_kill_switch_guardian(
+                weekly_pnl         = state["weekly_pnl_gbp"],
+                kill_threshold     = -kill_abs,
+                recent_net_returns = net_returns,
+            )
+        except Exception as e:
+            print(f"[risk] AI guardian failed: {e}")
+
+        action_note = (
+            "🤖 AI recommends: *reduce capital deployment*"
+            if ai_decision == "reduce"
+            else "🤖 AI recommends: *hold deployment* (likely temporary)"
+        )
         _send_telegram(
             f"⚠️ *Grid bot warning*\n"
             f"Weekly P&L: £{state['weekly_pnl_gbp']:.2f} "
             f"(50% of kill switch threshold)\n"
-            f"Kill switch triggers at -£{abs(TOTAL_CAPITAL_GBP * kill_pct):.2f}"
+            f"Kill switch triggers at -£{kill_abs:.2f}\n"
+            f"{action_note}"
         )
-        state["warning_sent"] = True
+        state["warning_sent"]  = True
+        state["ai_reduce_cap"] = (ai_decision == "reduce")
         _save(state)
 
 
@@ -205,6 +229,12 @@ def get_dynamic_capital_pct(base_capital_pct: float = 0.70) -> float:
         adjusted = max(0.60, base_capital_pct - 0.10)
     else:
         adjusted = base_capital_pct
+
+    # Priority 4: apply extra step-down if AI guardian recommended reducing capital
+    state = get_state()
+    if state.get("ai_reduce_cap") and adjusted > 0.50:
+        adjusted = max(0.50, adjusted - 0.10)
+        print(f"[risk] AI guardian step-down applied → capital_pct={adjusted:.2f}")
 
     if adjusted < base_capital_pct:
         print(
