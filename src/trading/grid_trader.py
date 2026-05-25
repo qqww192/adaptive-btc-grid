@@ -811,8 +811,7 @@ def _run() -> None:
     # 2b. Trend pause check (set by regime_classifier when strong trend detected)
     # Standing aside during confirmed trends avoids the recenter fee drag that causes break-even.
     if TREND_PAUSE_FLAG.exists():
-        print("[grid] Trend pause active — regime classifier detected strong trend. "
-              "Grid standing aside to avoid recenter fee drag. Exiting.")
+        print("[grid] Trend pause active — standing aside. Exiting.")
         return
 
     risk_state  = get_risk_state()

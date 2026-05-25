@@ -30,12 +30,28 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
+import httpx
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
 from trading.cdx_client import CDXClient
+
+
+def _send_telegram(message: str) -> None:
+    token   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+    if not token or not chat_id:
+        return
+    try:
+        httpx.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": message, "parse_mode": "Markdown"},
+            timeout=5,
+        )
+    except Exception:
+        pass
 
 
 DATA_FILE         = ROOT / "data" / "regime.json"
@@ -263,6 +279,7 @@ def run() -> None:
     # When the regime is a confirmed strong trend, set a flag that tells the
     # grid trader to stand aside entirely — avoiding recenter fee drag.
     # The flag is cleared as soon as the regime reverts to ranging or volatile.
+    was_paused      = TREND_PAUSE_FLAG.exists()
     is_strong_trend = (
         regime in ("trending_up", "trending_dn")
         and hmm_confidence >= TREND_PAUSE_CONFIDENCE
@@ -272,11 +289,25 @@ def run() -> None:
         TREND_PAUSE_FLAG.touch()
         print(f"[regime] Trend pause ACTIVATED ({regime} conf={hmm_confidence:.2f}) "
               f"— grid_trader will stand aside until regime reverts")
+        if not was_paused:
+            direction = "uptrend" if regime == "trending_up" else "downtrend"
+            _send_telegram(
+                f"⏸ *Grid paused — strong {direction} detected*\n"
+                f"Regime: `{regime}` (HMM {hmm_confidence:.0%} confident)\n"
+                f"ATR: ${atr:,.0f} | BBW: {bbw * 100:.1f}%\n"
+                f"Standing aside to avoid fee drag. Will resume when trend fades."
+            )
     else:
         TREND_PAUSE_FLAG.unlink(missing_ok=True)
         if regime in ("trending_up", "trending_dn"):
             print(f"[regime] Trend detected but confidence too low ({hmm_confidence:.2f} < "
                   f"{TREND_PAUSE_CONFIDENCE}) — grid continues")
+        if was_paused:
+            _send_telegram(
+                f"▶️ *Grid resumed — trend cleared*\n"
+                f"Regime: `{regime}` (HMM {hmm_confidence:.0%} confident)\n"
+                f"Grid is active again."
+            )
 
     payload = json.dumps(
         {
