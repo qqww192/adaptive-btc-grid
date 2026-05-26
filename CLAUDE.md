@@ -12,7 +12,7 @@ Runs continuously on an Oracle Cloud Always Free ARM VM (Ubuntu 22.04, UK Cardif
 
 ## Stack
 - Language: Python 3.11
-- Key libs: `httpx`, `python-dotenv`, `google-generativeai`
+- Key libs: `httpx`, `ccxt`, `python-dotenv`
 - AI: Groq (Qwen3-32B) primary + Cerebras (gpt-oss-120b) fallback — weekly optimisation
 - Infrastructure: Oracle Cloud Always Free ARM VM (Ubuntu 22.04, **UK Cardiff**)
 - Delivery: Telegram bot
@@ -23,7 +23,7 @@ Runs continuously on an Oracle Cloud Always Free ARM VM (Ubuntu 22.04, UK Cardif
 # Activate virtualenv (Oracle VM)
 source .venv/bin/activate
 
-# Run grid trader once (5-min job)
+# Run grid trader once (1-min job)
 python3 src/trading/grid_trader.py
 
 # Run regime classifier (4-hourly job)
@@ -32,7 +32,7 @@ python3 src/trading/regime_classifier.py
 # Send daily report manually
 python3 src/trading/daily_reporter.py
 
-# Run weekly Gemini optimisation
+# Run weekly AI optimisation (Groq/Cerebras)
 python3 src/trading/gemini_optimizer.py
 
 # Check live cron jobs
@@ -50,12 +50,12 @@ tail -20 data/trades.json | python3 -m json.tool
 
 ## Architecture
 See `docs/architecture.md`. Key points:
-- `src/trading/cdx_client.py` — all crypto.com API calls. Auth via HMAC-SHA256.
-- `src/trading/grid_trader.py` — 5-min orchestrator. Single point of entry.
+- `src/trading/cdx_client.py` — all crypto.com API calls via CCXT (handles HMAC-SHA256 signing).
+- `src/trading/grid_trader.py` — 1-min orchestrator. Single point of entry.
 - `src/trading/risk_manager.py` — kill switch guardian. Read this before touching P&L logic.
-- `src/trading/regime_classifier.py` — ATR-14 + Bollinger Band Width. Updates `data/regime.json`.
-- `src/trading/gemini_optimizer.py` — Sunday AI review with walk-forward validation.
-- `config/grid_params.json` — live grid parameters. Updated by Gemini; read by grid_trader.
+- `src/trading/regime_classifier.py` — 3-state Gaussian HMM (primary) + ATR-14/Bollinger Band Width fallback. Updates `data/regime.json`.
+- `src/trading/gemini_optimizer.py` — Sunday AI review (Groq/Cerebras) with walk-forward validation.
+- `config/grid_params.json` — live grid parameters. Updated by the AI optimiser; read by grid_trader.
 - `data/weekly_state.json` — current week P&L + kill switch flag. NEVER delete this.
 - `data/trades.json` — append-only trade ledger. One JSON object per line.
 
@@ -75,19 +75,19 @@ See `docs/architecture.md`. Key points:
 
 ## Grid trading key numbers
 - Maker fee: 0.25% per order → minimum profitable spacing: 0.55%
-- Default spacing: 0.8% (safe zone above break-even)
+- Default spacing: 1.0% (safe zone above break-even; ~0.50% net per fill)
 - Weekly kill switch: -10% of total capital (£15 on £150)
 - Warning threshold: -5% of total capital (£7.50)
-- Grid recentres when BTC moves >3% from last calibration price
-- Regime reclassification: every 4 hours via ATR-14 + Bollinger Band Width
+- Grid recentres when BTC moves >5% from last calibration price (`range_pct`)
+- Regime reclassification: every 4 hours via 3-state Gaussian HMM (ATR-14 + Bollinger Band Width fallback)
 - **Capital viability at £150 with 6 levels:**
   - Safe up to BTC ~$224,000 (minimum capital formula: `0.0001 × BTC_price × levels ÷ capital_pct ÷ gbp_usd_rate`)
   - If BTC approaches $200k → drop to 5 levels or top up to £200
   - Bot enforces this at runtime and sends Telegram alert if breached
 
 ## Self-learning loop
-- **Inner loop (every 5 min):** fill detection → risk check → order placement
-- **Outer loop (Sunday 23:00 UTC):** Gemini reviews 7-day metrics, proposes new params,
+- **Inner loop (every 1 min):** fill detection → risk check → order placement
+- **Outer loop (Sunday 23:00 UTC):** the AI optimiser reviews 7-day metrics, proposes new params,
   validates against 30-day walk-forward simulation, updates `config/grid_params.json`
 
 ## Git workflow
@@ -97,7 +97,7 @@ See `docs/architecture.md`. Key points:
 - Commit `config/grid_params.json` after every manual param change so the VM picks it up
 
 ## Parked work — do not implement without discussion
-- **Prediction markets module** (`src/trading/betfair_client.py` exists as a draft)
+- **Prediction markets module** (no code yet — earlier `betfair_client.py` draft was removed)
   - Polymarket: blocked — Oracle VM is in UK Cardiff, geo-blocked by Polymarket
   - Betfair: blocked — £299 live API activation fee, prohibitive for £150 capital
   - Matchbook: viable (free API, UK-regulated) but primarily sports markets

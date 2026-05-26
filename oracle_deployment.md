@@ -54,14 +54,14 @@ chmod +x oracle_setup/setup.sh
 The script will:
 - Install Python 3.11 and dependencies
 - Create the virtual environment
-- Install the crontab (all 5 scheduled jobs)
+- Install the crontab (all scheduled jobs)
 - Create the data/ directory
 
 ### 2.3 Verify crontab installed correctly
 ```bash
 crontab -l
 ```
-You should see 6 entries (5-min, 4-hourly, daily, Sunday, daily pull, log rotation).
+You should see 8 entries (1-min grid, 4-hourly regime, daily report, Saturday Optuna sweep, Sunday AI optimiser, daily git pull, Sunday log rotation, @reboot Telegram controller).
 
 ---
 
@@ -121,7 +121,7 @@ python3 src/trading/grid_trader.py
 ## Part 4: Go live
 
 1. Confirm your crypto.com account has USDT funded (start with £50 equivalent).
-2. Wait for the next 5-minute cron tick, or trigger manually:
+2. Wait for the next 1-minute cron tick, or trigger manually:
    ```bash
    python3 src/trading/grid_trader.py
    ```

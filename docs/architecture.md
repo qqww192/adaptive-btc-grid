@@ -5,7 +5,7 @@
 ```
 Oracle Cloud VM  (Ubuntu 22.04 ARM, crontab-driven)
         │
-        ├─ every 5 min ──► grid_trader.py   ← main bot loop
+        ├─ every 1 min ──► grid_trader.py   ← main bot loop
         │                       │
         │              ┌────────┴─────────┐
         │              ▼                  ▼
@@ -32,7 +32,7 @@ Oracle Cloud VM  (Ubuntu 22.04 ARM, crontab-driven)
                         data/trades.json (last 7 days)
                         cdx_client.py    (30 daily candles)
                                 │
-                        Gemini 1.5 Flash API (walk-forward validated)
+                        Groq / Cerebras AI (walk-forward validated)
                                 │
                         config/grid_params.json  ← only updated if improved
 ```
@@ -42,15 +42,15 @@ Oracle Cloud VM  (Ubuntu 22.04 ARM, crontab-driven)
 | Decision | Choice | Rationale |
 |---|---|---|
 | Scheduler | Oracle VM crontab | Always-on, low-latency, free tier |
-| All orders | `POST_ONLY` limit | Maker fee 0.25% vs taker 0.40%; profitable at 0.8% spacing |
+| All orders | `POST_ONLY` limit | Maker fee 0.25% vs taker 0.40%; profitable at 1.0% spacing (break-even 0.55%) |
 | State persistence | JSON files | Simple, inspectable, easy to back up with `git` |
 | Kill switch | Automatic, weekly reset | Hard stop at −10% weekly loss; resets Monday 00:00 UTC |
-| Regime detection | ATR-14 + Bollinger Band Width | Low complexity, well-understood, works on 4-hour cadence |
-| AI optimisation | Gemini 1.5 Flash + walk-forward | Sunday review only; walk-forward guard prevents overfitting |
+| Regime detection | 3-state Gaussian HMM (ATR-14 + BBW fallback) | Learns transition probabilities; classic indicators as fallback on 4-hour cadence |
+| AI optimisation | Groq (Qwen3-32B) / Cerebras fallback + walk-forward | Sunday review only; walk-forward guard prevents overfitting |
 | Capital reserve | ≥20% always | `capital_pct` capped at 0.80; buffer covers open BUY exposure |
 | Concurrency guard | PID lock file | Prevents overlapping cron runs on slow API calls |
 
-## Data Flow — 5-Minute Loop
+## Data Flow — 1-Minute Loop
 
 1. **Lock** — write PID to `data/grid_trader.lock`; exit if lock already held
 2. **Kill switch check** — read `data/weekly_state.json`; halt if active
@@ -58,7 +58,7 @@ Oracle Cloud VM  (Ubuntu 22.04 ARM, crontab-driven)
 4. **Fetch price** — `GET /public/get-ticker` via `cdx_client.py`
 5. **Detect fills** — diff open orders vs order history; log to `data/trades.json`
 6. **Risk update** — `risk_manager.record_trade()` on each SELL fill; may trigger kill switch
-7. **Recalibrate** — cancel all + reset grid if price moved >3% from last calibration
+7. **Recalibrate** — cancel all + reset grid if price moved >5% (`range_pct`) from last calibration
 8. **Place grid** — `POST_ONLY` limit orders at each level not already occupied
 9. **Save state** — write `data/grid_state.json`
 10. **Unlock** — remove `data/grid_trader.lock`
@@ -66,8 +66,8 @@ Oracle Cloud VM  (Ubuntu 22.04 ARM, crontab-driven)
 ## Grid Maths
 
 ```
-levels          = config["levels"]          # e.g. 10
-spacing_pct     = config["spacing_pct"]     # e.g. 0.8%
+levels          = config["levels"]          # e.g. 6
+spacing_pct     = config["spacing_pct"]     # e.g. 1.0%
 capital_usdt    = total_capital_gbp * capital_pct * gbp_usd_rate
 per_level_usdt  = capital_usdt / levels
 
@@ -82,11 +82,15 @@ for i in range(levels):
 
 | Path | Purpose |
 |---|---|
-| `src/trading/cdx_client.py` | crypto.com Exchange REST client; HMAC-SHA256 auth |
-| `src/trading/grid_trader.py` | 5-min orchestrator; single entry point |
+| `src/trading/cdx_client.py` | crypto.com Exchange client via CCXT (handles HMAC-SHA256 signing) |
+| `src/trading/grid_trader.py` | 1-min orchestrator; single entry point |
 | `src/trading/risk_manager.py` | Kill switch guardian; weekly P&L accounting |
-| `src/trading/regime_classifier.py` | ATR + BBW market regime; writes `data/regime.json` |
-| `src/trading/gemini_optimizer.py` | Sunday AI review; updates `config/grid_params.json` |
+| `src/trading/regime_classifier.py` | 3-state Gaussian HMM (+ ATR/BBW fallback); writes `data/regime.json` |
+| `src/trading/gemini_optimizer.py` | Sunday AI review (Groq/Cerebras); updates `config/grid_params.json` |
+| `src/trading/optuna_optimizer.py` | Saturday Optuna Bayesian sweep; writes `data/optuna_candidates.json` |
+| `src/trading/ai_advisor.py` | Per-run AI trade advice (10s timeout, protects cron window) |
+| `src/trading/news_sentiment.py` | Cached BTC news sentiment (FreeCryptoAPI); read by the 1-min loop |
+| `src/trading/telegram_controller.py` | Interactive Telegram controller (persistent async process) |
 | `src/trading/daily_reporter.py` | 08:00 UTC Telegram report |
 | `src/trading/trade_logger.py` | Append-only JSON fill ledger |
 | `config/grid_params.json` | Live grid parameters (committed; VM pulls nightly) |

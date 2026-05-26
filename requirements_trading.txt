@@ -25,11 +25,6 @@ prometheus-client>=0.20.0
 # Skill 8: CCXT Pro WebSocket (event-driven fill detection)
 # Included in ccxt package above; enable Pro tier separately on the VM.
 
-# Skill 9: FinRL DRL (optional — heavy, requires separate install step)
-# finrl>=3.0.0
-# stable-baselines3>=2.0.0
-# torch>=2.1.0
-
 # AI optimiser providers (weekly grid param review — both free tier, no card needed)
 # Primary: Groq (Qwen3-32B). Fallback: Cerebras (gpt-oss-120b).
 # Both use OpenAI-compatible API — no extra library needed, httpx handles the calls.

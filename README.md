@@ -131,8 +131,6 @@ src/
   backtesting/
     grid_backtest.py        — Fixed-level FIFO backtester (matches live topology)
     backtest_2020_2026.py   — 2020–2025 historical comparison (3 scenarios)
-  ml/
-    drl_optimizer.py        — Deep RL param optimiser (optional, heavy deps)
 config/
   grid_params.json          — Live grid parameters (updated by AI every Sunday)
 data/
