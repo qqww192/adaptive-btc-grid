@@ -101,17 +101,29 @@ class CDXClient:
 
     def get_portfolio_value_gbp(self, gbp_usd_rate: float = 1.27) -> dict:
         """
-        Return total portfolio value in GBP: USDT free + BTC free converted to USDT.
+        Return total portfolio value in GBP, valuing the *total* balance
+        (free + funds locked in open grid orders) for both currencies.
+
+        Using `total` rather than `free` is essential: a running grid keeps
+        most of its capital tied up in live limit orders (reported as `used`),
+        so a free-only sum understates the real portfolio.
 
         Returns:
           total_gbp      — combined GBP value of all BTC and USDT held
-          usdt_free      — USDT free balance
-          btc_free       — BTC free balance
-          btc_price_usdt — BTC/USDT mid-price used for BTC valuation
+          usdt_total     — USDT total balance (free + used)
+          btc_total      — BTC total balance (free + used)
+          btc_value_gbp  — GBP value of the BTC holding
+          btc_price_usdt — BTC/USDT price used for BTC valuation
+          usdt_free      — USDT free balance (transparency)
+          btc_free       — BTC free balance (transparency)
         """
         balance    = self._call(self._ex.fetch_balance)
-        usdt_free  = float((balance.get("USDT") or {}).get("free") or 0)
-        btc_free   = float((balance.get("BTC")  or {}).get("free") or 0)
+        usdt_node  = balance.get("USDT") or {}
+        btc_node   = balance.get("BTC")  or {}
+        usdt_total = float(usdt_node.get("total") or 0)
+        btc_total  = float(btc_node.get("total")  or 0)
+        usdt_free  = float(usdt_node.get("free")  or 0)
+        btc_free   = float(btc_node.get("free")   or 0)
 
         btc_price = 0.0
         try:
@@ -120,15 +132,18 @@ class CDXClient:
         except Exception:
             pass
 
-        btc_in_usdt = btc_free * btc_price if btc_price > 0 else 0.0
-        total_usdt  = usdt_free + btc_in_usdt
+        btc_in_usdt = btc_total * btc_price if btc_price > 0 else 0.0
+        total_usdt  = usdt_total + btc_in_usdt
         total_gbp   = total_usdt / gbp_usd_rate if gbp_usd_rate else 0.0
 
         return {
             "total_gbp":      round(total_gbp, 2),
+            "usdt_total":     round(usdt_total, 4),
+            "btc_total":      round(btc_total, 8),
+            "btc_value_gbp":  round((btc_in_usdt / gbp_usd_rate) if gbp_usd_rate else 0.0, 2),
+            "btc_price_usdt": round(btc_price, 2),
             "usdt_free":      round(usdt_free, 4),
             "btc_free":       round(btc_free, 8),
-            "btc_price_usdt": round(btc_price, 2),
         }
 
     # ------------------------------------------------------------------ #

@@ -37,6 +37,8 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
 from trading.cdx_client import CDXClient
+from trading.news_sentiment import get_market_sentiment, summarise
+from trading.ai_advisor import ask_strategy_stance
 
 
 def _send_telegram(message: str) -> None:
@@ -275,27 +277,47 @@ def run() -> None:
 
     params = REGIME_PARAMS[regime]
 
-    # ── Trend pause flag ─────────────────────────────────────────────────────
-    # When the regime is a confirmed strong trend, set a flag that tells the
-    # grid trader to stand aside entirely — avoiding recenter fee drag.
-    # The flag is cleared as soon as the regime reverts to ranging or volatile.
+    # ── News-aware strategy stance (bounded recommendation) ──────────────────
+    # Fetch market sentiment (populates the 4h cache the grid loop reads) and
+    # ask the AI for a safe stance. The stance only selects among already-safe
+    # behaviours; STAND_ASIDE can pause, never force a trade. Fully degrades to
+    # NEUTRAL if news or AI is unavailable.
+    sentiment = get_market_sentiment()
+    try:
+        stance = ask_strategy_stance(regime, sentiment, candles)
+    except Exception as e:
+        print(f"[regime] Stance fetch failed: {e} — defaulting to NEUTRAL")
+        stance = "NEUTRAL"
+    print(f"[regime] Stance: {stance} | Sentiment: {summarise(sentiment) or 'n/a'}")
+
+    # ── Trend / stand-aside pause flag ───────────────────────────────────────
+    # The flag tells grid_trader to stand aside entirely (avoiding recenter fee
+    # drag). It activates on a confirmed strong trend OR an AI STAND_ASIDE
+    # stance, and clears as soon as neither holds.
     was_paused      = TREND_PAUSE_FLAG.exists()
     is_strong_trend = (
         regime in ("trending_up", "trending_dn")
         and hmm_confidence >= TREND_PAUSE_CONFIDENCE
     )
-    if is_strong_trend:
+    stand_aside  = (stance == "STAND_ASIDE")
+    should_pause = is_strong_trend or stand_aside
+    if should_pause:
         TREND_PAUSE_FLAG.parent.mkdir(parents=True, exist_ok=True)
         TREND_PAUSE_FLAG.touch()
-        print(f"[regime] Trend pause ACTIVATED ({regime} conf={hmm_confidence:.2f}) "
-              f"— grid_trader will stand aside until regime reverts")
+        reason = "strong trend" if is_strong_trend else "AI stance STAND_ASIDE"
+        print(f"[regime] Pause ACTIVATED ({reason}; {regime} conf={hmm_confidence:.2f}) "
+              f"— grid_trader will stand aside until conditions clear")
         if not was_paused:
-            direction = "uptrend" if regime == "trending_up" else "downtrend"
+            if is_strong_trend:
+                direction = "uptrend" if regime == "trending_up" else "downtrend"
+                headline = f"strong {direction} detected"
+            else:
+                headline = "AI recommends standing aside"
             _send_telegram(
-                f"⏸ *Grid paused — strong {direction} detected*\n"
-                f"Regime: `{regime}` (HMM {hmm_confidence:.0%} confident)\n"
+                f"⏸ *Grid paused — {headline}*\n"
+                f"Regime: `{regime}` (HMM {hmm_confidence:.0%} confident) · Stance: `{stance}`\n"
                 f"ATR: ${atr:,.0f} | BBW: {bbw * 100:.1f}%\n"
-                f"Standing aside to avoid fee drag. Will resume when trend fades."
+                f"Standing aside to protect capital. Will resume when conditions clear."
             )
     else:
         TREND_PAUSE_FLAG.unlink(missing_ok=True)
@@ -304,8 +326,8 @@ def run() -> None:
                   f"{TREND_PAUSE_CONFIDENCE}) — grid continues")
         if was_paused:
             _send_telegram(
-                f"▶️ *Grid resumed — trend cleared*\n"
-                f"Regime: `{regime}` (HMM {hmm_confidence:.0%} confident)\n"
+                f"▶️ *Grid resumed — conditions cleared*\n"
+                f"Regime: `{regime}` (HMM {hmm_confidence:.0%} confident) · Stance: `{stance}`\n"
                 f"Grid is active again."
             )
 
@@ -317,6 +339,8 @@ def run() -> None:
             "atr":            round(atr, 2),
             "bbw_pct":        round(bbw * 100, 2),
             "recommended":    params,
+            "stance":         stance,
+            "sentiment":      sentiment,
             "updated_at":     datetime.now(timezone.utc).isoformat(),
         },
         indent=2,

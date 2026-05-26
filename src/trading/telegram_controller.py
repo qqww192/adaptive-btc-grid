@@ -44,6 +44,7 @@ CONFIG_FILE      = ROOT / "config" / "grid_params.json"
 REGIME_FILE      = ROOT / "data"   / "regime.json"
 STATE_FILE       = ROOT / "data"   / "weekly_state.json"
 HEARTBEAT_FILE   = ROOT / "data"   / "last_heartbeat.json"
+PORTFOLIO_FILE   = ROOT / "data"   / "portfolio.json"
 PAUSE_FLAG       = ROOT / "data"   / "paused.flag"
 RECENTER_FLAG    = ROOT / "data"   / "force_recenter.flag"
 TREND_PAUSE_FLAG = ROOT / "data"   / "trend_pause.flag"   # set by regime_classifier
@@ -79,14 +80,17 @@ def _build_status() -> str:
     regime = _read_json(REGIME_FILE)
     hb     = _read_json(HEARTBEAT_FILE)
     cfg    = _read_json(CONFIG_FILE)
+    pf     = _read_json(PORTFOLIO_FILE)
+    sentiment = regime.get("sentiment") or {}
     paused       = PAUSE_FLAG.exists()
     trend_paused = TREND_PAUSE_FLAG.exists()
 
     kill   = state.get("kill_switch_on", False)
     pnl    = state.get("weekly_pnl_gbp", 0.0)
     trades = state.get("trades_this_week", 0)
-    price  = hb.get("price", 0)
-    cap    = cfg.get("total_capital", 0)
+    price  = pf.get("btc_price_usdt") or hb.get("price", 0)
+    # Live whole-portfolio value (snapshot) preferred over the cached config figure.
+    cap    = pf.get("total_gbp") if pf.get("total_gbp") is not None else cfg.get("total_capital", 0)
 
     if paused:
         status_icon = "⏸ PAUSED (manual)"
@@ -97,22 +101,37 @@ def _build_status() -> str:
     else:
         status_icon = "🟢 Running"
 
+    gbp_usd = cfg.get("gbp_usd_rate", 1.27) or 1.27
+    unreal  = pf.get("unrealised_gbp")
+    alltime = pf.get("realised_alltime_gbp")
+    since   = pf.get("since_tracking_gbp")
+
     lines = [
         f"📊 *Grid Bot Status*",
         f"",
         f"{status_icon}",
         f"",
-        f"💰 Week P&L: *{'%+.2f' % pnl} GBP*",
-        f"📈 Trades this week: {trades}",
+        f"💼 Portfolio: *£{cap:.2f}*" if cap else "",
+        (f"   £{pf['usdt_total'] / gbp_usd:.2f} cash · £{pf.get('btc_value_gbp', 0):.2f} BTC"
+         if pf.get("usdt_total") is not None else ""),
+        f"   Avg buy (held BTC): ${pf['avg_cost_btc']:,.0f}" if pf.get("avg_cost_btc") else "",
         f"₿ BTC price: ${price:,.0f}" if price else "",
-        f"💼 Portfolio: £{cap:.2f}" if cap else "",
+        f"",
+        f"📈 Unrealised (held BTC): {'%+.2f' % unreal} GBP" if unreal is not None else "",
+        f"💰 Realised week: *{'%+.2f' % pnl} GBP*",
+        f"📊 Realised all-time: {'%+.2f' % alltime} GBP" if alltime is not None else "",
+        f"📦 Since tracking: {'%+.2f' % since} GBP" if since is not None else "",
+        f"🔁 Trades this week: {trades}",
         f"",
         f"⚙️ Grid config:",
         f"  Regime: {regime.get('regime', 'unknown').replace('_', '-')} "
         f"(HMM conf={regime.get('hmm_confidence', 0):.2f})",
+        f"  Stance: {regime.get('stance', 'NEUTRAL')}",
         f"  Spacing: {cfg.get('spacing_pct', '?')}% · "
         f"Levels: {cfg.get('levels', '?')} · "
         f"Capital: {int(cfg.get('capital_pct', 0)*100)}%",
+        (f"  Fear & Greed: {sentiment['fear_greed']} ({sentiment.get('fg_class', '')})"
+         if sentiment.get("fear_greed") is not None else ""),
         f"",
         f"🕐 Last heartbeat: {_heartbeat_age()}",
     ]

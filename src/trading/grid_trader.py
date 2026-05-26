@@ -49,7 +49,7 @@ from trading.risk_manager import (
     record_trade,
     record_warning,
 )
-from trading.trade_logger import append as log_trade
+from trading.trade_logger import append as log_trade, read_all as read_all_trades
 from trading.ai_advisor import (
     ask_recenter,
     ask_regime,
@@ -64,6 +64,7 @@ REGIME_FILE     = ROOT / "data"   / "regime.json"
 GRID_STATE_FILE = ROOT / "data"   / "grid_state.json"
 LOCK_FILE       = ROOT / "data"   / "grid_trader.lock"
 HEARTBEAT_FILE  = ROOT / "data"   / "last_heartbeat.json"
+PORTFOLIO_FILE  = ROOT / "data"   / "portfolio.json"    # live balance + P&L snapshot
 PAUSE_FLAG      = ROOT / "data"   / "paused.flag"        # Telegram controller
 RECENTER_FLAG   = ROOT / "data"   / "force_recenter.flag" # Telegram controller
 TREND_PAUSE_FLAG = ROOT / "data"  / "trend_pause.flag"   # regime_classifier: strong trend detected
@@ -174,39 +175,123 @@ def release_lock() -> None:
 #  Config helpers                                                      #
 # ------------------------------------------------------------------ #
 
-def refresh_total_capital(cdx: CDXClient, config: dict) -> dict:
+def refresh_total_capital(
+    cdx:        CDXClient,
+    config:     dict,
+    grid_state: dict,
+    risk_state: dict,
+) -> dict:
     """
-    Fetch live USDT + BTC portfolio value from crypto.com and update
-    total_capital in config (in memory and on disk).
+    Size the bot off the live whole portfolio and snapshot live P&L.
 
-    Skips the update if the API call fails — the last persisted value is used.
-    Skips if the live value is implausibly small (<£10) to guard against
-    a partially-settled balance snapshot returning near-zero.
+    Every run, `total_capital` is set to the real crypto.com balance (free +
+    funds locked in open orders) so grid notional, the kill-switch threshold,
+    the viability check, and the optimizer all scale with the actual balance.
+    The static £150 only ever survives as a first-run bootstrap when the API
+    is unreachable.
+
+    Also writes data/portfolio.json — the single source of truth that the
+    daily reporter and Telegram /status read (no extra live API calls there).
+
+    Skips the capital update if the API call fails (last value is kept) or if
+    the live value is implausibly small (<£10), guarding against a
+    partially-settled balance snapshot returning near-zero.
     """
     gbp_usd = config.get("gbp_usd_rate", 1.27)
     try:
-        portfolio  = cdx.get_portfolio_value_gbp(gbp_usd_rate=gbp_usd)
-        live_gbp   = portfolio["total_gbp"]
-        if live_gbp < 10:
-            print(f"[grid] Live portfolio £{live_gbp:.2f} — suspiciously low, keeping cached value")
-            return config
-
-        prev = config.get("total_capital", 0)
-        config["total_capital"] = live_gbp
-        if abs(live_gbp - prev) > 0.50:
-            print(
-                f"[grid] Portfolio updated: £{prev:.2f} → £{live_gbp:.2f} "
-                f"(USDT={portfolio['usdt_free']:.2f}, "
-                f"BTC={portfolio['btc_free']:.6f} @ ${portfolio['btc_price_usdt']:,.0f})"
-            )
-            # Persist so risk_manager, optimizer, and daily_reporter all see the same value.
-            if CONFIG_FILE.exists():
-                merged = json.loads(CONFIG_FILE.read_text())
-                merged["total_capital"] = live_gbp
-                _atomic_write(CONFIG_FILE, json.dumps(merged, indent=2))
+        portfolio = cdx.get_portfolio_value_gbp(gbp_usd_rate=gbp_usd)
     except Exception as e:
         print(f"[grid] Portfolio fetch failed: {e} — using cached total_capital={config.get('total_capital')}")
+        return config
+
+    live_gbp = portfolio["total_gbp"]
+    if live_gbp < 10:
+        print(f"[grid] Live portfolio £{live_gbp:.2f} — suspiciously low, keeping cached value")
+        return config
+
+    prev = config.get("total_capital", 0)
+    config["total_capital"] = live_gbp
+    if abs(live_gbp - prev) > 0.50:
+        print(
+            f"[grid] Portfolio updated: £{prev:.2f} → £{live_gbp:.2f} "
+            f"(USDT={portfolio['usdt_total']:.2f}, "
+            f"BTC={portfolio['btc_total']:.6f} @ ${portfolio['btc_price_usdt']:,.0f})"
+        )
+        # Persist so risk_manager, optimizer, and daily_reporter all see the same value.
+        if CONFIG_FILE.exists():
+            merged = json.loads(CONFIG_FILE.read_text())
+            merged["total_capital"] = live_gbp
+            _atomic_write(CONFIG_FILE, json.dumps(merged, indent=2))
+
+    _write_portfolio_snapshot(portfolio, config, grid_state, risk_state)
     return config
+
+
+def _write_portfolio_snapshot(
+    portfolio:  dict,
+    config:     dict,
+    grid_state: dict,
+    risk_state: dict,
+) -> None:
+    """
+    Compute live P&L and persist data/portfolio.json every run.
+
+    P&L views:
+      - unrealised : (price − avg cost of held BTC) × BTC held, GBP
+      - realised   : this week (risk_manager) + all-time (whole trade ledger)
+      - since tracking : total now − baseline auto-snapshotted on first run
+    """
+    gbp_usd   = config.get("gbp_usd_rate", 1.27) or 1.27
+    btc_price = portfolio.get("btc_price_usdt", 0.0)
+    btc_total = portfolio.get("btc_total", 0.0)
+    total_gbp = portfolio.get("total_gbp", 0.0)
+
+    # Average cost of held BTC = mean of outstanding (unpaired) BUY fill prices.
+    # buy_prices_queue stores prices only; per-level qty is near-equal so a
+    # simple mean is a fair display approximation of cost basis.
+    buy_q       = grid_state.get("buy_prices_queue") or []
+    avg_cost    = (sum(buy_q) / len(buy_q)) if buy_q else None
+    unrealised  = (
+        (btc_price - avg_cost) * btc_total / gbp_usd
+        if (avg_cost and btc_total > 0) else None
+    )
+
+    realised_week    = float(risk_state.get("weekly_pnl_gbp", 0.0))
+    try:
+        realised_alltime = sum(float(t.get("net_gbp", 0.0)) for t in read_all_trades())
+    except Exception:
+        realised_alltime = 0.0
+
+    # Baseline: auto-snapshot the whole-portfolio value on the first run that
+    # sees a valid balance. Labelled "since tracking started" — no deposit
+    # figure is required from the user.
+    baseline = None
+    if PORTFOLIO_FILE.exists():
+        try:
+            baseline = json.loads(PORTFOLIO_FILE.read_text()).get("baseline_gbp")
+        except Exception:
+            baseline = None
+    if baseline is None:
+        baseline = total_gbp
+
+    snapshot = {
+        "total_gbp":            round(total_gbp, 2),
+        "usdt_total":           portfolio.get("usdt_total", 0.0),
+        "btc_total":            btc_total,
+        "btc_value_gbp":        portfolio.get("btc_value_gbp", 0.0),
+        "btc_price_usdt":       btc_price,
+        "avg_cost_btc":         round(avg_cost, 2) if avg_cost else None,
+        "unrealised_gbp":       round(unrealised, 2) if unrealised is not None else None,
+        "realised_week_gbp":    round(realised_week, 2),
+        "realised_alltime_gbp": round(realised_alltime, 2),
+        "baseline_gbp":         round(baseline, 2),
+        "since_tracking_gbp":   round(total_gbp - baseline, 2),
+        "updated_at":           datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        _atomic_write(PORTFOLIO_FILE, json.dumps(snapshot, indent=2))
+    except Exception as e:
+        print(f"[grid] Failed to write portfolio snapshot: {e}")
 
 
 def load_config() -> dict:
@@ -353,13 +438,23 @@ _REGIME_GRID_SKEW = {
 }
 
 
-def build_grid(center_price: float, config: dict, regime: str = "ranging") -> list[dict]:
+def build_grid(
+    center_price: float,
+    config:       dict,
+    regime:       str = "ranging",
+    stance:       str = "NEUTRAL",
+) -> list[dict]:
     """
     Generate grid levels around center_price.
 
     buy_fraction is regime-aware: trending_up skews 60% buy / 40% sell,
     trending_dn skews 40% buy / 60% sell, others are symmetric 50/50.
     This reduces the wasted half-grid that never fills during trends.
+
+    The AI strategy stance modulates this within safe bounds:
+      WITH_TREND / NEUTRAL → keep the regime skew (today's behaviour)
+      AGAINST_TREND        → force a symmetric grid (fade the range)
+    STAND_ASIDE is handled upstream by the trend-pause flag (no grid built).
 
     Returns a list of dicts, each with:
       level     — index (0 = bottom buy, levels-1 = top sell)
@@ -374,7 +469,10 @@ def build_grid(center_price: float, config: dict, regime: str = "ranging") -> li
     capital_usdt   = capital_gbp * gbp_usd
     per_level_usdt = capital_usdt / levels
 
-    buy_frac  = _REGIME_GRID_SKEW.get(regime, 0.50)
+    if stance == "AGAINST_TREND":
+        buy_frac = 0.50
+    else:
+        buy_frac = _REGIME_GRID_SKEW.get(regime, 0.50)
     n_buys    = round(levels * buy_frac)
     n_sells   = levels - n_buys
     # Ensure at least 1 level on each side
@@ -819,12 +917,14 @@ def _run() -> None:
     regime_data = load_regime()
     regime      = regime_data.get("regime", "ranging")
     hmm_conf    = float(regime_data.get("hmm_confidence", 0.0))
+    stance      = regime_data.get("stance", "NEUTRAL")
 
     grid_state = load_grid_state()
     cdx        = CDXClient()
 
     # 3. Refresh total_capital from live portfolio (replaces hardcoded £150)
-    config = refresh_total_capital(cdx, config)
+    #    and snapshot live P&L to data/portfolio.json.
+    config = refresh_total_capital(cdx, config, grid_state, risk_state)
 
     # 4. Apply regime-recommended params if HMM is confident (Skill 2 fix)
     config = apply_regime_params(config, regime_data)
@@ -874,7 +974,7 @@ def _run() -> None:
         except Exception as e:
             print(f"[grid] AI regime fetch failed: {e} — using HMM regime")
 
-    print(f"[grid] BTC/USDT: {price:,.2f} | Regime: {regime} (HMM conf={hmm_conf:.2f})")
+    print(f"[grid] BTC/USDT: {price:,.2f} | Regime: {regime} (HMM conf={hmm_conf:.2f}) | Stance: {stance}")
 
     # 6. Detect fills from previous orders
     detect_fills(cdx, grid_state, config, regime, risk_state)
@@ -985,7 +1085,7 @@ def _run() -> None:
     # calibration_price is always set — either from disk state or from the
     # recenter that just ran above (which sets it to the live price).
     grid_center = grid_state.get("calibration_price") or price
-    levels = build_grid(grid_center, config, regime=regime)
+    levels = build_grid(grid_center, config, regime=regime, stance=stance)
     place_grid(cdx, levels, grid_state, best_bid=best_bid, best_ask=best_ask)
 
     # Count active orders for Prometheus

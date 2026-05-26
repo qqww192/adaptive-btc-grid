@@ -114,6 +114,18 @@ def _cache_set(key: str, value: str) -> None:
         pass
 
 
+def _sentiment_line() -> str:
+    """
+    Compact sentiment summary read from the news cache (no network).
+    Returns '' if unavailable so prompts stay price-only as before.
+    """
+    try:
+        from trading.news_sentiment import load_cached_sentiment, summarise
+        return summarise(load_cached_sentiment(), max_headlines=2)
+    except Exception:
+        return ""
+
+
 # ------------------------------------------------------------------ #
 #  1. Smart recenter decision                                          #
 # ------------------------------------------------------------------ #
@@ -141,10 +153,12 @@ def ask_recenter(
         print(f"[ai] Recenter (cached): {cached}")
         return decision
 
+    sentiment = _sentiment_line()
+    sentiment_txt = f" Market sentiment: {sentiment}." if sentiment else ""
     prompt = (
         f"BTC grid bot. Grid calibrated at ${calibration_price:,.0f}. "
         f"Price now ${current_price:,.0f} ({move_pct:+.1f}%). "
-        f"Recent closes: {price_trail}. Regime: {regime}. "
+        f"Recent closes: {price_trail}. Regime: {regime}.{sentiment_txt} "
         f"Is this a real trend shift requiring grid recentering, or a temporary spike likely to revert? "
         f"Reply with one word only: RECENTER or HOLD."
     )
@@ -193,9 +207,11 @@ def ask_regime(
         print(f"[ai] Regime (cached): {cached}")
         return cached
 
+    sentiment = _sentiment_line()
+    sentiment_txt = f" Market sentiment: {sentiment}." if sentiment else ""
     prompt = (
         f"BTC/USDT last 8 candles: range={range_pct:.1f}%, net move={net_move_pct:+.1f}%. "
-        f"HMM says '{hmm_regime}' but confidence is only {hmm_confidence:.0%}. "
+        f"HMM says '{hmm_regime}' but confidence is only {hmm_confidence:.0%}.{sentiment_txt} "
         f"Classify the market regime. "
         f"Reply with one word: RANGING, TRENDING_UP, TRENDING_DOWN, or VOLATILE."
     )
@@ -318,3 +334,74 @@ def ask_kill_switch_guardian(
     print(f"[ai] Kill switch guardian: {decision.upper()}  (raw: '{response}')")
     _cache_set(key, decision)
     return decision
+
+
+# ------------------------------------------------------------------ #
+#  5. Strategy stance — bounded recommendation                         #
+# ------------------------------------------------------------------ #
+
+VALID_STANCES = ("WITH_TREND", "AGAINST_TREND", "STAND_ASIDE", "NEUTRAL")
+
+
+def ask_strategy_stance(
+    regime:         str,
+    sentiment:      Optional[dict],
+    recent_candles: list[dict],
+) -> str:
+    """
+    Ask the AI which grid stance fits the current regime + news, within the
+    bot's safety limits. The bot only ever picks among already-safe behaviours:
+
+      WITH_TREND    — keep trading, skew the grid in the trend direction
+      AGAINST_TREND — keep trading, fade the range (default symmetric grid)
+      STAND_ASIDE   — pause trading until conditions clear
+      NEUTRAL       — no strong view; behave as today
+
+    Falls back to NEUTRAL (current behaviour) if the AI or news is unavailable.
+    The stance can never disable the kill switch, raise capital, or force a trade.
+    """
+    closes = [c["close"] for c in recent_candles[-8:]] if recent_candles else []
+    net_move_pct = ((closes[-1] - closes[0]) / closes[0] * 100) if len(closes) >= 2 else 0.0
+
+    fg_txt = ""
+    head_txt = ""
+    if sentiment:
+        if sentiment.get("fear_greed") is not None:
+            fg_txt = f"Fear&Greed {sentiment['fear_greed']} ({sentiment.get('fg_class','')}). "
+        heads = sentiment.get("headlines") or []
+        if heads:
+            head_txt = "Headlines: " + " | ".join(heads[:3]) + ". "
+
+    key = _cache_key("stance", regime, f"{net_move_pct:+.1f}",
+                     str(sentiment.get("fear_greed") if sentiment else ""))
+    cached = _cache_get(key)
+    if cached is not None:
+        print(f"[ai] Stance (cached): {cached}")
+        return cached if cached in VALID_STANCES else "NEUTRAL"
+
+    prompt = (
+        f"Conservative BTC/USDT spot grid bot (low-risk, capital preservation first). "
+        f"Regime: {regime}. 8-candle net move: {net_move_pct:+.1f}%. "
+        f"{fg_txt}{head_txt}"
+        f"Pick the safest grid stance for the coming hours. "
+        f"WITH_TREND = keep trading but skew the grid in the trend direction; "
+        f"AGAINST_TREND = keep trading, fade the range; "
+        f"STAND_ASIDE = pause trading until it's clearer; "
+        f"NEUTRAL = no strong view. "
+        f"Reply with exactly one: WITH_TREND, AGAINST_TREND, STAND_ASIDE, or NEUTRAL."
+    )
+
+    response = _call_ai(prompt, max_tokens=8)
+    if response is None:
+        print("[ai] Stance fallback → NEUTRAL (AI unavailable)")
+        return "NEUTRAL"
+
+    r = response.upper()
+    stance = "NEUTRAL"
+    for s in ("STAND_ASIDE", "WITH_TREND", "AGAINST_TREND", "NEUTRAL"):
+        if s in r:
+            stance = s
+            break
+    print(f"[ai] Strategy stance: {stance}  (raw: '{response}')")
+    _cache_set(key, stance)
+    return stance

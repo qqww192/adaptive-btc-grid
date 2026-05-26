@@ -193,6 +193,26 @@ def _build_prompt(
 
     stance_text = f"\nYour analytical stance: {agent_stance}\n" if agent_stance else ""
 
+    # Market sentiment + AI stance (written 4-hourly by regime_classifier).
+    sentiment_text = ""
+    try:
+        if REGIME_FILE.exists():
+            rd        = json.loads(REGIME_FILE.read_text())
+            sentiment = rd.get("sentiment") or {}
+            news_stance = rd.get("stance", "")
+            bits = []
+            if sentiment.get("fear_greed") is not None:
+                bits.append(f"Fear&Greed {sentiment['fear_greed']} ({sentiment.get('fg_class','')})")
+            heads = sentiment.get("headlines") or []
+            if heads:
+                bits.append("Top headlines: " + " | ".join(heads[:3]))
+            if news_stance:
+                bits.append(f"Current AI stance: {news_stance}")
+            if bits:
+                sentiment_text = "\nMarket sentiment & news:\n- " + "\n- ".join(bits) + "\n"
+    except Exception:
+        sentiment_text = ""
+
     return f"""You are a {agent_role}.
 The bot runs a spot BTC/USDT grid strategy on crypto.com Exchange.
 Total capital: £{total_capital}. Weekly kill switch: 10%.
@@ -202,6 +222,7 @@ Current parameters:
 {json.dumps(current_config, indent=2)}
 
 Market regime: {regime}
+{sentiment_text}
 
 Last 7 days metrics:
 {json.dumps(metrics_7d, indent=2)}

@@ -56,9 +56,13 @@ def format_report() -> str:
     regime_file = ROOT / "data" / "regime.json"
     regime      = "unknown"
     grid_range  = "n/a"
+    stance      = ""
+    sentiment   = {}
     if regime_file.exists():
-        rd     = json.loads(regime_file.read_text())
-        regime = rd.get("regime", "unknown")
+        rd        = json.loads(regime_file.read_text())
+        regime    = rd.get("regime", "unknown")
+        stance    = rd.get("stance", "")
+        sentiment = rd.get("sentiment") or {}
 
     config_file = ROOT / "config" / "grid_params.json"
     spacing     = "n/a"
@@ -67,6 +71,18 @@ def format_report() -> str:
         cfg     = json.loads(config_file.read_text())
         spacing = f"{cfg.get('spacing_pct', '?')}%"
         levels  = str(cfg.get("levels", "?"))
+
+    # Live portfolio + P&L snapshot (written every run by grid_trader).
+    portfolio_file = ROOT / "data" / "portfolio.json"
+    pf = {}
+    if portfolio_file.exists():
+        try:
+            pf = json.loads(portfolio_file.read_text())
+        except Exception:
+            pf = {}
+    # Fallback to the persisted capital figure if the snapshot is missing.
+    if not pf and config_file.exists():
+        pf = {"total_gbp": cfg.get("total_capital")}
 
     now = datetime.now(timezone.utc)
     date_str = (now.replace(hour=0) - __import__("datetime").timedelta(days=1)).strftime("%a %d %b %Y")
@@ -81,22 +97,70 @@ def format_report() -> str:
     ]
 
     if buys:
-        lines.append(f"• Avg buy price: ${avg_buy:,.0f}")
+        lines.append(f"• Avg buy (yesterday): ${avg_buy:,.0f}")
     if sells:
-        lines.append(f"• Avg sell price: ${avg_sell:,.0f}")
+        lines.append(f"• Avg sell (yesterday): ${avg_sell:,.0f}")
 
     lines += [
         f"• Gross P&L: {pnl_sign}£{gross:.2f}",
         f"• Fees paid: £{fees / float(os.environ.get('GBP_USD_RATE', '1.27')):.2f}",
         f"• Net P&L: *{pnl_sign}£{net:.2f}*",
+    ]
+
+    # ---- Portfolio (live whole-account value) ----
+    lines += [f"", f"💼 *Portfolio*"]
+    if pf.get("total_gbp") is not None:
+        lines.append(f"• Total value: *£{pf['total_gbp']:.2f}*")
+    if pf.get("usdt_total") is not None and pf.get("btc_value_gbp") is not None:
+        lines.append(
+            f"• Split: £{pf['usdt_total'] / float(os.environ.get('GBP_USD_RATE', '1.27')):.2f} cash "
+            f"· £{pf['btc_value_gbp']:.2f} BTC"
+        )
+    if pf.get("btc_total"):
+        lines.append(f"• BTC held: {pf['btc_total']:.6f} @ ${pf.get('btc_price_usdt', 0):,.0f}")
+    if pf.get("avg_cost_btc"):
+        lines.append(f"• Avg buy (held BTC): ${pf['avg_cost_btc']:,.0f}")
+
+    # ---- Live P&L ----
+    lines += [f"", f"📈 *Live P&L*"]
+    unreal = pf.get("unrealised_gbp")
+    if unreal is not None:
+        u_sign = "+" if unreal >= 0 else ""
+        u_pct  = ""
+        if pf.get("btc_value_gbp"):
+            base = pf["btc_value_gbp"] - unreal
+            if base > 0:
+                u_pct = f" ({u_sign}{unreal / base * 100:.1f}%)"
+        lines.append(f"• Unrealised (held BTC): {u_sign}£{unreal:.2f}{u_pct}")
+    lines.append(f"• Realised this week: {week_sign}£{risk['weekly_pnl_gbp']:.2f}")
+    if pf.get("realised_alltime_gbp") is not None:
+        a_sign = "+" if pf["realised_alltime_gbp"] >= 0 else ""
+        lines.append(f"• Realised all-time: {a_sign}£{pf['realised_alltime_gbp']:.2f}")
+    if pf.get("since_tracking_gbp") is not None:
+        s_sign = "+" if pf["since_tracking_gbp"] >= 0 else ""
+        lines.append(f"• Since tracking started: {s_sign}£{pf['since_tracking_gbp']:.2f}")
+
+    lines += [
         f"",
         f"💰 *Week-to-date*",
         f"• Running P&L: *{week_sign}£{risk['weekly_pnl_gbp']:.2f}*",
         f"• Kill switch: {'🔴 ACTIVE' if risk['kill_switch_on'] else '🟢 Off'}",
         f"",
         f"⚙️ *Current grid*",
-        f"• Regime: {regime}",
+        f"• Regime: {regime}" + (f" · Stance: {stance}" if stance else ""),
         f"• Spacing: {spacing} · Levels: {levels}",
+    ]
+
+    # ---- Market sentiment ----
+    if sentiment.get("fear_greed") is not None or sentiment.get("headlines"):
+        lines += [f"", f"📰 *Market sentiment*"]
+        if sentiment.get("fear_greed") is not None:
+            lines.append(f"• Fear & Greed: {sentiment['fear_greed']} ({sentiment.get('fg_class', '')})")
+        heads = sentiment.get("headlines") or []
+        if heads:
+            lines.append(f"• {heads[0]}")
+
+    lines += [
         f"",
         f"━━━━━━━━━━━━━━━━━━━━━",
         f"_Next report: {now.strftime('%a')} 08:00 UTC_",
