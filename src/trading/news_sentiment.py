@@ -35,8 +35,9 @@ MAX_HEADLINES = 6
 HTTP_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; BTCTradeBot/1.0; +grid)"}
 
 FEAR_GREED_URL = "https://api.alternative.me/fng/?limit=1"
-# FreeCryptoAPI news endpoint (Bearer-token auth). Verify the exact path against
-# https://freecryptoapi.com/documentation/ — overridable via FREECRYPTOAPI_NEWS_URL.
+# FreeCryptoAPI news endpoint (Bearer-token auth); BTC-filtered via ?search=btc.
+# Returns {"status", "pagination", "news": [{"title", "source", ...}]}.
+# Overridable via FREECRYPTOAPI_NEWS_URL.
 FREECRYPTOAPI_NEWS_URL = "https://api.freecryptoapi.com/v1/getNews"
 RSS_FEEDS = [
     "https://www.coindesk.com/arc/outboundfeeds/rss/",
@@ -122,7 +123,7 @@ def get_freecryptoapi_headlines(limit: int = MAX_HEADLINES) -> list[dict]:
     try:
         r = httpx.get(
             url,
-            params={"symbol": "BTC"},
+            params={"search": "btc", "limit": limit},
             headers={**HTTP_HEADERS, "Authorization": f"Bearer {api_key}"},
             timeout=HTTP_TIMEOUT,
         )
@@ -131,7 +132,8 @@ def get_freecryptoapi_headlines(limit: int = MAX_HEADLINES) -> list[dict]:
         for item in _extract_news_items(r.json()):
             title = _extract_title(item)
             if title:
-                out.append({"title": title, "source": "freecryptoapi"})
+                src = item.get("source") if isinstance(item, dict) else None
+                out.append({"title": title, "source": src or "freecryptoapi"})
             if len(out) >= limit:
                 break
         return out
