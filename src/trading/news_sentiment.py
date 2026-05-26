@@ -39,6 +39,9 @@ FEAR_GREED_URL = "https://api.alternative.me/fng/?limit=1"
 # Returns {"status", "pagination", "news": [{"title", "source", ...}]}.
 # Overridable via FREECRYPTOAPI_NEWS_URL.
 FREECRYPTOAPI_NEWS_URL = "https://api.freecryptoapi.com/v1/getNews"
+
+# cryptocurrency.cv — free, no API key required, 200+ sources.
+CRYPTOCURRENCYCV_NEWS_URL = "https://cryptocurrency.cv/api/news"
 RSS_FEEDS = [
     "https://www.coindesk.com/arc/outboundfeeds/rss/",
     "https://cointelegraph.com/rss/tag/bitcoin",
@@ -142,6 +145,26 @@ def get_freecryptoapi_headlines(limit: int = MAX_HEADLINES) -> list[dict]:
         return []
 
 
+def get_cryptocurrencycv_headlines(limit: int = MAX_HEADLINES) -> list[dict]:
+    """BTC headlines from cryptocurrency.cv — free, no API key required."""
+    try:
+        r = httpx.get(
+            CRYPTOCURRENCYCV_NEWS_URL,
+            params={"q": "bitcoin", "limit": limit},
+            headers=HTTP_HEADERS,
+            timeout=HTTP_TIMEOUT,
+        )
+        r.raise_for_status()
+        articles = r.json().get("articles", [])
+        return [
+            {"title": a["title"], "source": a.get("source", "cryptocurrency.cv")}
+            for a in articles if a.get("title")
+        ][:limit]
+    except Exception as e:
+        print(f"[news] cryptocurrency.cv fetch failed: {e}")
+        return []
+
+
 def get_rss_headlines(limit: int = MAX_HEADLINES) -> list[dict]:
     """Return recent crypto headlines from public RSS feeds. No API key required."""
     out = []
@@ -200,7 +223,7 @@ def get_market_sentiment(max_age: int = CACHE_TTL, force: bool = False) -> Optio
             return cached
 
     fg        = get_fear_greed()
-    headlines = get_freecryptoapi_headlines() + get_rss_headlines()
+    headlines = get_cryptocurrencycv_headlines() + get_rss_headlines()
 
     if fg is None and not headlines:
         # Nothing available — let callers fall back to price-only behaviour.
