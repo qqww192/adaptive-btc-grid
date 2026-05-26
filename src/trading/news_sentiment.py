@@ -3,7 +3,7 @@ News & sentiment feed — gives the AI a view of the market beyond price candles
 
 Aggregates three free sources, each degrading gracefully if unavailable:
   1. Fear & Greed Index    — alternative.me (no key)
-  2. FreeCryptoAPI news     — BTC headlines (needs FREECRYPTOAPI_KEY)
+  2. cryptocurrency.cv     — BTC headlines, 200+ sources (no key)
   3. RSS headlines          — CoinDesk / Cointelegraph (no key)
 
 Design principles (mirrors ai_advisor.py):
@@ -35,12 +35,6 @@ MAX_HEADLINES = 6
 HTTP_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; BTCTradeBot/1.0; +grid)"}
 
 FEAR_GREED_URL = "https://api.alternative.me/fng/?limit=1"
-# FreeCryptoAPI news endpoint (Bearer-token auth); BTC-filtered via ?search=btc.
-# Returns {"status", "pagination", "news": [{"title", "source", ...}]}.
-# Overridable via FREECRYPTOAPI_NEWS_URL.
-FREECRYPTOAPI_NEWS_URL = "https://api.freecryptoapi.com/v1/getNews"
-
-# cryptocurrency.cv — free, no API key required, 200+ sources.
 CRYPTOCURRENCYCV_NEWS_URL = "https://cryptocurrency.cv/api/news"
 RSS_FEEDS = [
     "https://www.coindesk.com/arc/outboundfeeds/rss/",
@@ -81,68 +75,6 @@ def get_fear_greed() -> Optional[dict]:
     except Exception as e:
         print(f"[news] Fear & Greed fetch failed: {e}")
         return None
-
-
-def _extract_news_items(payload) -> list:
-    """
-    Pull the list of news items out of a JSON payload regardless of wrapper.
-    Handles a bare list, or a dict wrapping the list under a common key.
-    """
-    if isinstance(payload, list):
-        return payload
-    if isinstance(payload, dict):
-        for key in ("news", "data", "results", "articles", "response", "items"):
-            val = payload.get(key)
-            if isinstance(val, list):
-                return val
-    return []
-
-
-def _extract_title(item) -> str:
-    """Best-effort title extraction across likely field names."""
-    if isinstance(item, str):
-        return item.strip()
-    if isinstance(item, dict):
-        for key in ("title", "headline", "text", "name", "description"):
-            val = item.get(key)
-            if isinstance(val, str) and val.strip():
-                return val.strip()
-    return ""
-
-
-def get_freecryptoapi_headlines(limit: int = MAX_HEADLINES) -> list[dict]:
-    """
-    Return recent BTC headlines from FreeCryptoAPI's news endpoint.
-    Skipped silently (returns []) when FREECRYPTOAPI_KEY is not set.
-
-    Auth is a Bearer token. Parsing is defensive (wrapper key + title field
-    are auto-detected) so minor response-shape differences degrade gracefully
-    rather than crashing the 4-hourly job.
-    """
-    api_key = os.environ.get("FREECRYPTOAPI_KEY", "")
-    if not api_key:
-        return []
-    url = os.environ.get("FREECRYPTOAPI_NEWS_URL", FREECRYPTOAPI_NEWS_URL)
-    try:
-        r = httpx.get(
-            url,
-            params={"search": "btc", "limit": limit},
-            headers={**HTTP_HEADERS, "Authorization": f"Bearer {api_key}"},
-            timeout=HTTP_TIMEOUT,
-        )
-        r.raise_for_status()
-        out = []
-        for item in _extract_news_items(r.json()):
-            title = _extract_title(item)
-            if title:
-                src = item.get("source") if isinstance(item, dict) else None
-                out.append({"title": title, "source": src or "freecryptoapi"})
-            if len(out) >= limit:
-                break
-        return out
-    except Exception as e:
-        print(f"[news] FreeCryptoAPI fetch failed: {e}")
-        return []
 
 
 def get_cryptocurrencycv_headlines(limit: int = MAX_HEADLINES) -> list[dict]:
