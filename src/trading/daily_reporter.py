@@ -35,9 +35,42 @@ def send(message: str) -> None:
         print(f"[reporter] Telegram send failed: {e}")
 
 
+INSTRUMENT = "BTC_USDT"
+
+
 def format_report() -> str:
     yesterday = read_yesterday()
     risk      = get_risk_state()
+
+    # When the local ledger has no entries for yesterday (e.g. fill detection failed),
+    # fall back to the exchange API so the count is still correct.
+    _ledger_fallback = False
+    if not yesterday:
+        try:
+            from trading.cdx_client import CDXClient
+            cdx     = CDXClient()
+            now_utc = datetime.now(timezone.utc)
+            ystart  = (now_utc - timedelta(days=1)).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            ).isoformat()
+            yend    = now_utc.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+            raw     = cdx.get_filled_orders_since(INSTRUMENT, ystart)
+            yesterday = [
+                {
+                    "side":       o["side"],
+                    "price_usdt": float(o.get("avg_price") or o["price"]),
+                    "qty_btc":    float(o.get("cumulative_quantity") or o["qty"]),
+                    "fee_usdt":   float(o.get("cumulative_fee") or 0),
+                    "gross_gbp":  0.0,
+                    "net_gbp":    0.0,
+                    "ts":         o.get("ts", ""),
+                }
+                for o in raw
+                if ystart <= o.get("ts", "")[:19] < yend
+            ]
+            _ledger_fallback = bool(yesterday)
+        except Exception as e:
+            print(f"[reporter] Live API fallback failed: {e}")
 
     # ---- Yesterday stats ----
     buys   = [t for t in yesterday if t["side"] == "BUY"]
@@ -171,6 +204,8 @@ def format_report() -> str:
         # Bot running but nothing filled — could be grid miscalibrated, spread too wide,
         # or POST_ONLY orders silently rejected. Flag it explicitly.
         lines.insert(5, f"⚠️ *Zero fills in 24h* — check grid positioning vs current BTC price")
+    elif _ledger_fallback:
+        lines.insert(4, f"⚠️ *Ledger gap* — counts from exchange API · P&L unavailable")
 
     # Heartbeat staleness check — warn if bot hasn't run in >25 minutes
     heartbeat_file = ROOT / "data" / "last_heartbeat.json"

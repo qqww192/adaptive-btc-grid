@@ -13,6 +13,7 @@ CCXT handles:
 """
 
 import os
+from datetime import datetime
 from typing import Any
 
 import ccxt
@@ -274,3 +275,18 @@ class CDXClient:
                 self._ex.fetch_orders, self._sym(instrument), limit=limit
             )
         return [self._norm_order(o) for o in orders]
+
+    def get_filled_orders_since(self, instrument: str, since_iso: str, limit: int = 200) -> list[dict]:
+        """Return FILLED orders placed on or after since_iso (ISO timestamp string)."""
+        since_ms = int(datetime.fromisoformat(since_iso).timestamp() * 1000)
+        try:
+            orders = self._call(
+                self._ex.fetch_closed_orders, self._sym(instrument),
+                since=since_ms, limit=limit
+            )
+        except CDXError:
+            orders = self._call(
+                self._ex.fetch_orders, self._sym(instrument),
+                since=since_ms, limit=limit
+            )
+        return [o for o in [self._norm_order(x) for x in orders] if o.get("status") == "FILLED"]
