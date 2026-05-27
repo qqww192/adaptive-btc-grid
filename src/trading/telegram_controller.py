@@ -106,10 +106,20 @@ def _build_status() -> str:
     alltime = pf.get("realised_alltime_gbp")
     since   = pf.get("since_tracking_gbp")
 
+    hmm_conf      = float(regime.get("hmm_confidence", 0.0))
+    regime_str    = regime.get("regime", "")
+    resume_hint   = None
+    if trend_paused:
+        if regime_str in ("trending_up", "trending_dn"):
+            resume_hint = f"▶️ Resumes when HMM conf drops below 70% (now {hmm_conf:.0%}) or regime → ranging"
+        else:
+            resume_hint = "▶️ Resumes at next regime reclassification (4-hourly)"
+
     lines = [
         f"📊 *Grid Bot Status*",
         f"",
         f"{status_icon}",
+        resume_hint,
         f"",
         f"💼 Portfolio: *£{cap:.2f}*" if cap else "",
         (f"   £{pf['usdt_total'] / gbp_usd:.2f} cash · £{pf.get('btc_value_gbp', 0):.2f} BTC"
