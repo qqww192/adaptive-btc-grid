@@ -821,9 +821,62 @@ def cancel_all_and_clear(cdx: CDXClient, grid_state: dict) -> bool:
     return True
 
 
-# ------------------------------------------------------------------ #
-#  Main                                                                #
-# ------------------------------------------------------------------ #
+def _handle_trend_pause_orders(regime: str) -> None:
+    """
+    Cancel the dangerous-direction orders when a trend pause is active.
+
+    trending_dn → cancel open BUY orders (buying into a falling market causes losses)
+    trending_up → cancel open SELL orders (selling early exits BTC before the top)
+
+    Idempotent: fetches live open orders each call, so repeated calls during a
+    multi-minute pause safely no-op once the relevant side is already gone.
+    """
+    if regime not in ("trending_dn", "trending_up"):
+        return
+
+    dangerous_side = "BUY" if regime == "trending_dn" else "SELL"
+    direction_label = "down" if regime == "trending_dn" else "up"
+
+    try:
+        cdx = CDXClient()
+        open_orders = cdx.get_open_orders(INSTRUMENT)
+    except Exception as e:
+        print(f"[grid] trend-pause cancel: could not fetch open orders: {e}")
+        return
+
+    to_cancel = [o for o in open_orders if o.get("side") == dangerous_side]
+    if not to_cancel:
+        return
+
+    grid_state  = load_grid_state()
+    cancel_ids  = {o["order_id"] for o in to_cancel}
+    failed      = []
+
+    for o in to_cancel:
+        try:
+            cdx.cancel_order(INSTRUMENT, o["order_id"])
+        except Exception as e:
+            print(f"[grid] trend-pause: failed to cancel {o['order_id']}: {e}")
+            failed.append(o["order_id"])
+
+    # Remove successfully cancelled orders from grid state
+    grid_state["levels"] = {
+        k: v for k, v in grid_state["levels"].items()
+        if v.get("order_id") not in (cancel_ids - set(failed))
+    }
+    save_grid_state(grid_state)
+
+    cancelled_count = len(to_cancel) - len(failed)
+    msg = (
+        f"📉 *Trend pause ({direction_label})* — cancelled {cancelled_count} "
+        f"{dangerous_side} order(s) to avoid directional risk."
+    )
+    if failed:
+        msg += f"\n⚠️ {len(failed)} order(s) could not be cancelled — check exchange."
+    print(f"[grid] {msg}")
+    _send_telegram_alert(msg)
+
+
 
 def run() -> None:
     if not acquire_lock():
@@ -907,8 +960,11 @@ def _run() -> None:
         return
 
     # 2b. Trend pause check (set by regime_classifier when strong trend detected)
-    # Standing aside during confirmed trends avoids the recenter fee drag that causes break-even.
+    # Cancel the dangerous-direction orders (buys on dn-trend, sells on up-trend)
+    # to avoid directional risk. Idempotent — safe to call every minute.
     if TREND_PAUSE_FLAG.exists():
+        regime_data = load_regime()
+        _handle_trend_pause_orders(regime_data.get("regime", ""))
         print("[grid] Trend pause active — standing aside. Exiting.")
         return
 
