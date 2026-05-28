@@ -196,7 +196,7 @@ def format_report() -> str:
     lines += [
         f"",
         f"━━━━━━━━━━━━━━━━━━━━━",
-        f"_Next report: {now.strftime('%a')} 08:00 UTC_",
+        f"_Next report: {(now + timedelta(days=1)).strftime('%a')} 08:00 UTC_",
     ]
 
     if not yesterday:

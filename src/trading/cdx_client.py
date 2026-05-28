@@ -13,7 +13,7 @@ CCXT handles:
 """
 
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import ccxt
@@ -79,6 +79,13 @@ class CDXClient:
             "rejected":  "REJECTED",
         }
         fee = o.get("fee") or {}
+        # CCXT exposes the fill time as ISO-8601 in `datetime` and ms in `timestamp`.
+        # The daily reporter's API fallback filters by `ts`, so it must be populated.
+        ts = o.get("datetime") or ""
+        if not ts and o.get("lastTradeTimestamp"):
+            ts = datetime.fromtimestamp(o["lastTradeTimestamp"] / 1000, tz=timezone.utc).isoformat()
+        if not ts and o.get("timestamp"):
+            ts = datetime.fromtimestamp(o["timestamp"] / 1000, tz=timezone.utc).isoformat()
         return {
             "order_id":            str(o.get("id", "")),
             "status":              status_map.get(o.get("status", ""), (o.get("status") or "").upper()),
@@ -89,6 +96,7 @@ class CDXClient:
             "instrument_name":     (o.get("symbol") or "").replace("/", "_"),
             "price":               float(o.get("price") or 0),
             "quantity":            float(o.get("amount") or 0),
+            "ts":                  ts,
         }
 
     # ------------------------------------------------------------------ #
