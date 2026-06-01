@@ -37,7 +37,7 @@ recent losing weeks.
 
 Constants mirror the live code so the simulation stays faithful:
   MAKER_FEE          0.25%/leg   (grid_backtest.MAKER_FEE)
-  TRAIL_STOP_PCT     3.0%        (grid_trader.TRAIL_STOP_PCT)
+  trailing stop      3.0%        (the OLD fixed grid_trader stop — the whipsaw we fixed)
   trend slope gate   ±4% / 5d    (regime_classifier.classify_rules)
 """
 
@@ -57,7 +57,8 @@ from backtesting.grid_backtest import GridConfig  # reused config + properties
 # ── Constants mirrored from the live bot ─────────────────────────────────────
 MAKER_FEE              = 0.0025   # 0.25% per leg (grid_backtest.MAKER_FEE)
 MIN_QTY_BTC            = 0.0001
-LIVE_TRAIL_STOP_PCT    = 3.0      # grid_trader.TRAIL_STOP_PCT (the whipsaw culprit)
+LIVE_TRAIL_STOP_PCT    = 3.0      # the OLD fixed stop the `current` policy reproduces
+                                  # (live is now volatility-scaled via _trail_stop_pct)
 SLOPE_GATE_PCT         = 4.0      # regime_classifier.classify_rules 5-candle slope
 ATR_RANGING_PCT        = 1.5
 BBW_RANGING_PCT        = 3.0

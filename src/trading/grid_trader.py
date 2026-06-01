@@ -1366,6 +1366,16 @@ def _run() -> None:
     levels = build_grid(grid_center, config, regime=regime, stance=stance)
     place_grid(cdx, levels, grid_state, best_bid=best_bid, best_ask=best_ask)
 
+    # 8b. Complementary trend sleeve (OFF unless config.trend_sleeve_enabled).
+    #     Spot, long-only, maker-only; earns during a confirmed up-trend and is
+    #     governed by the same weekly kill switch. Strict no-op when disabled.
+    if config.get("trend_sleeve_enabled", False):
+        try:
+            from trading.trend_sleeve import run_sleeve
+            run_sleeve(cdx, regime_data, price, best_bid, best_ask, config, INSTRUMENT)
+        except Exception as e:
+            print(f"[grid] trend sleeve error (non-fatal): {e}")
+
     # Count active orders for Prometheus
     active_orders = sum(
         1 for info in grid_state["levels"].values() if info.get("order_id")

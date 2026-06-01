@@ -7,7 +7,11 @@
   "total_capital": 170,
   "gbp_usd_rate":  1.27,
   "kill_pct":      0.10,
+  "trend_sleeve_enabled": false,
+  "trend_sleeve_pct":     0.10,
   "_notes": {
+    "trend_sleeve_enabled": "OFF by default. When true, runs a small spot long-only maker trend-follower (src/trading/trend_sleeve.py) during CONFIRMED up-trends, governed by the same weekly kill switch. Enable only after paper testing.",
+    "trend_sleeve_pct":     "Fraction of total_capital allocated to the trend sleeve when enabled (0.10 = ~£17). One position at a time.",
     "spacing_pct":       "Grid level spacing as % of price. 1.0% base (net ~0.50%/fill above 0.25% maker fee). Min viable: 0.55%. Widens to 1.2-1.6% in confirmed trend/volatile regimes.",
     "range_pct":         "Recenter threshold: grid recenters when price moves more than this % from calibration_price. Also used as stale-order distance.",
     "levels":            "Total grid orders. 4 keeps order sizes above the exchange minimum at the £170/20%-active size. Regime-aware buy/sell skew.",
