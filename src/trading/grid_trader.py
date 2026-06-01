@@ -1388,8 +1388,9 @@ def _run() -> None:
 
     # 9. Save state + heartbeat
     grid_state["last_run"] = datetime.now(timezone.utc).isoformat()
-    # Snapshot current P&L so the Monday briefing has last week's real numbers
-    # even after get_risk_state() resets the weekly counter on Monday.
+    # Re-read risk state so that any fills processed in this run are included in
+    # the prev_week snapshot used by the Monday briefing.
+    risk_state = get_risk_state()
     grid_state["prev_week_pnl_gbp"] = risk_state.get("weekly_pnl_gbp", 0)
     grid_state["prev_week_trades"]  = risk_state.get("trades_this_week", 0)
     save_grid_state(grid_state)

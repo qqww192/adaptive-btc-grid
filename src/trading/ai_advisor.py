@@ -41,11 +41,20 @@ CACHE_TTL  = 1200     # 20 minutes — one decision per price event
 #  Internal helpers                                                    #
 # ------------------------------------------------------------------ #
 
+import re as _re
+
+def _strip_thinking(text: str) -> str:
+    """Remove <think>...</think> reasoning blocks emitted by Qwen3 and similar models."""
+    return _re.sub(r"<think>.*?</think>", "", text, flags=_re.DOTALL).strip()
+
+
 def _call_ai(prompt: str, max_tokens: int = 15) -> Optional[str]:
     """Call Groq then Cerebras. Return response text or None on failure."""
     providers = [
-        {"url": GROQ_URL,     "model": GROQ_MODEL,     "key": os.environ.get("GROQ_API_KEY", "")},
-        {"url": CEREBRAS_URL, "model": CEREBRAS_MODEL, "key": os.environ.get("CEREBRAS_API_KEY", "")},
+        {"url": GROQ_URL,     "model": GROQ_MODEL,     "key": os.environ.get("GROQ_API_KEY", ""),
+         "extra": {"thinking": {"type": "disabled"}}},
+        {"url": CEREBRAS_URL, "model": CEREBRAS_MODEL, "key": os.environ.get("CEREBRAS_API_KEY", ""),
+         "extra": {}},
     ]
     for p in providers:
         if not p["key"]:
@@ -59,11 +68,13 @@ def _call_ai(prompt: str, max_tokens: int = 15) -> Optional[str]:
                     "messages":    [{"role": "user", "content": prompt}],
                     "max_tokens":  max_tokens,
                     "temperature": 0.1,
+                    **p["extra"],
                 },
                 timeout=AI_TIMEOUT,
             )
             r.raise_for_status()
-            return r.json()["choices"][0]["message"]["content"].strip()
+            text = r.json()["choices"][0]["message"]["content"].strip()
+            return _strip_thinking(text) or None
         except Exception as e:
             print(f"[ai] {p['model']} failed: {e}")
     return None
