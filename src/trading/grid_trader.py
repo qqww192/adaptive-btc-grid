@@ -71,14 +71,31 @@ TREND_PAUSE_FLAG = ROOT / "data"  / "trend_pause.flag"   # regime_classifier: st
 PROM_DIR        = ROOT / "data"   / "prometheus"
 
 RECENTER_CONFIRM_MINUTES    = 20   # force recenter if AI keeps saying HOLD past this
-TRAIL_STOP_PCT              = 3.0  # Strategy D: trailing stop fires if BTC drops this % from pause peak
+TRAIL_STOP_MIN_PCT          = 5.0  # Strategy D: trailing-stop floor (widened from 3% to stop whipsaw)
+TRAIL_STOP_ATR_MULT         = 1.5  # trail = max(MIN_PCT, ATR_MULT × daily ATR%) — volatility-scaled
 PAUSE_STATUS_INTERVAL_MIN   = 30   # send a Telegram status update at most once per N minutes while paused
+
+
+def _trail_stop_pct(regime_data: dict, price: float) -> float:
+    """
+    Volatility-aware trailing-stop distance.
+
+    The old fixed 3% stop whipsawed: in a normal up-trend a routine 3% pullback
+    liquidated the accumulated bag (often below cost). We widen the floor to 5%
+    and scale with the daily ATR (from regime.json) so the stop sits outside
+    ordinary noise and only fires on a genuine reversal.
+    """
+    atr_usdt = float(regime_data.get("atr", 0.0) or 0.0)
+    atr_pct  = (atr_usdt / price * 100) if price else 0.0
+    return max(TRAIL_STOP_MIN_PCT, TRAIL_STOP_ATR_MULT * atr_pct)
 
 SAFE_BOUNDS = {
     "spacing_pct": (0.55, 3.0),
     "range_pct":   (2.0,  15.0),
     "levels":      (4,    20),
-    "capital_pct": (0.40, 0.80),
+    # Lower bound dropped to 0.10 to support the £170 / 20%-active profile.
+    # Upper bound stays 0.80 (CLAUDE.md: always keep ≥20% reserve).
+    "capital_pct": (0.10, 0.80),
     "kill_pct":    (0.05, 0.15),
 }
 
@@ -387,6 +404,13 @@ def apply_regime_params(config: dict, regime_data: dict) -> dict:
     regime      = regime_data.get("regime", "ranging")
 
     if not recommended or confidence < HMM_CONFIDENCE_THRESHOLD:
+        return config
+
+    # For a directional trend, only widen to the trend grid once the regime
+    # classifier has CONFIRMED it (HMM+rule agreement held for the hysteresis
+    # window). An unconfirmed single read keeps the base (ranging) params, so the
+    # bot doesn't flip-flop spacing on noise. Ranging/volatile are unaffected.
+    if regime in ("trending_up", "trending_dn") and not regime_data.get("confirmed_trend", False):
         return config
 
     blended = dict(config)
@@ -893,16 +917,17 @@ def _handle_trend_pause_orders(
 
 
 def _check_trailing_stop(
-    cdx: CDXClient, grid_state: dict, price: float, best_bid: float
+    cdx: CDXClient, grid_state: dict, price: float, best_bid: float, trail_pct: float
 ) -> None:
     """
-    Strategy D trailing stop for trending_up pauses.
+    Strategy D trailing stop for trending_up STAND_ASIDE pauses.
 
     Tracks the rolling peak price seen since the pause started and sells all
-    free BTC via a POST_ONLY limit order if price drops TRAIL_STOP_PCT% from
-    that peak.  Idempotent — once trail_stop_fired is set in grid_state the
-    function no-ops on every subsequent tick.
-    Mutates grid_state in place; caller is responsible for saving it.
+    free BTC via a POST_ONLY limit order if price drops `trail_pct`% from that
+    peak.  `trail_pct` is now volatility-scaled (see _trail_stop_pct) — widened
+    from the old fixed 3% that whipsawed on ordinary pullbacks.  Idempotent —
+    once trail_stop_fired is set in grid_state the function no-ops on every
+    subsequent tick.  Mutates grid_state in place; caller saves it.
     """
     if grid_state.get("trail_stop_fired"):
         return
@@ -912,13 +937,13 @@ def _check_trailing_stop(
     new_peak  = max(prev_peak, price)
     grid_state["trend_peak_price"] = new_peak
 
-    trail_price = new_peak * (1 - TRAIL_STOP_PCT / 100)
+    trail_price = new_peak * (1 - trail_pct / 100)
     if price >= trail_price:
         return  # still above stop level — nothing to do
 
     # ── Trailing stop fires ──────────────────────────────────────────────────
     print(f"[grid] Trailing stop fired: price {price:,.2f} < stop {trail_price:,.2f} "
-          f"(peak {new_peak:,.2f} − {TRAIL_STOP_PCT}%)")
+          f"(peak {new_peak:,.2f} − {trail_pct:.1f}%)")
 
     # 1. Cancel all remaining open orders so BTC is freed from locked buy orders
     try:
@@ -953,7 +978,7 @@ def _check_trailing_stop(
                  else "⚠️ Sell order could not be placed — check exchange manually")
     msg = (
         f"🔴 *Trailing stop fired!*\n"
-        f"BTC dropped {TRAIL_STOP_PCT:.0f}% from peak: ${new_peak:,.0f} → ${price:,.0f}\n"
+        f"BTC dropped {trail_pct:.1f}% from peak: ${new_peak:,.0f} → ${price:,.0f}\n"
         f"{sell_line}\n"
         f"Grid standing by. Will resume automatically when trend weakens."
     )
@@ -999,7 +1024,8 @@ def _send_pause_status(
 
     if regime == "trending_up" and price > 0:
         peak        = grid_state.get("trend_peak_price", price)
-        trail_price = peak * (1 - TRAIL_STOP_PCT / 100)
+        trail_pct   = _trail_stop_pct(regime_data, price)
+        trail_price = peak * (1 - trail_pct / 100)
         drop_pct    = (peak - price) / peak * 100
         stop_gap    = (price - trail_price) / price * 100
         fired       = grid_state.get("trail_stop_fired", False)
@@ -1011,7 +1037,7 @@ def _send_pause_status(
             warn = " ⚠️ *Close!*" if stop_gap < 0.5 else ""
             status_line = (
                 f"💰 BTC: ${price:,.0f} | 📈 Peak: ${peak:,.0f} | Drop from peak: {drop_pct:.1f}%\n"
-                f"🛑 Trailing stop: ${trail_price:,.0f} ({TRAIL_STOP_PCT:.0f}% below peak) "
+                f"🛑 Trailing stop: ${trail_price:,.0f} ({trail_pct:.1f}% below peak) "
                 f"— {stop_gap:.1f}% away{warn}"
             )
             action_line = (
@@ -1144,9 +1170,10 @@ def _run() -> None:
         if not grid_state.get("trail_stop_fired"):
             _handle_trend_pause_orders(cdx, grid_state, regime_str)
 
-        # Strategy D: trailing stop for uptrends
+        # Strategy D: trailing stop for uptrends (volatility-scaled distance)
         if regime_str == "trending_up" and price_tp > 0:
-            _check_trailing_stop(cdx, grid_state, price_tp, best_bid_tp)
+            trail_pct = _trail_stop_pct(regime_data, price_tp)
+            _check_trailing_stop(cdx, grid_state, price_tp, best_bid_tp, trail_pct)
 
         # Periodic Telegram status (throttled to PAUSE_STATUS_INTERVAL_MIN)
         _send_pause_status(grid_state, regime_data, price_tp)

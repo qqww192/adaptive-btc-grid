@@ -2,19 +2,19 @@
   "instrument":    "BTC_USDT",
   "spacing_pct":   1.0,
   "range_pct":     5.0,
-  "levels":        6,
-  "capital_pct":   0.70,
-  "total_capital": 150,
+  "levels":        4,
+  "capital_pct":   0.20,
+  "total_capital": 170,
   "gbp_usd_rate":  1.27,
   "kill_pct":      0.10,
   "_notes": {
-    "spacing_pct":       "Grid level spacing as % of price. 1.0% optimal for £150 capital (net 0.50%/fill vs 0.30% at 0.8%). Min viable: 0.55%.",
+    "spacing_pct":       "Grid level spacing as % of price. 1.0% base (net ~0.50%/fill above 0.25% maker fee). Min viable: 0.55%. Widens to 1.2-1.6% in confirmed trend/volatile regimes.",
     "range_pct":         "Recenter threshold: grid recenters when price moves more than this % from calibration_price. Also used as stale-order distance.",
-    "levels":            "Total grid orders. Regime-aware asymmetry: ranging=4buy/2sell, trending_up=4buy/2sell, trending_dn=2buy/4sell.",
-    "capital_pct":       "Fraction of total_capital to deploy (keep ≥20% as reserve). Auto-refreshed from live balance each run.",
-    "total_capital":     "Refreshed automatically from live crypto.com portfolio (USDT + BTC value) at each run. Manual value used as fallback.",
-    "gbp_usd_rate":      "GBP/USD rate for P&L reporting. Update in .env — currently ~1.32 (May 2026).",
-    "kill_pct":          "Weekly loss limit as fraction of total_capital (0.10 = 10%). Tightened to 0.08 in trending_dn regime.",
-    "minimum_capital":   "Formula: 0.0001 * BTC_price * levels / capital_pct / gbp_usd_rate. At BTC ~$105k: 6 levels → £75 min. Bot enforces this at runtime."
+    "levels":            "Total grid orders. 4 keeps order sizes above the exchange minimum at the £170/20%-active size. Regime-aware buy/sell skew.",
+    "capital_pct":       "Fraction of total_capital to deploy. 0.20 = ~£34 active per week (≥80% reserve). Auto-stepped DOWN by CDaR in drawdown (risk_manager), and to the regime preset on a confirmed trend.",
+    "total_capital":     "Start £170. Refreshed automatically from live crypto.com portfolio (USDT + BTC value) at each run. Manual value is the fallback.",
+    "gbp_usd_rate":      "GBP/USD rate for P&L reporting. Update in .env.",
+    "kill_pct":          "Weekly loss limit as fraction of total_capital (0.10 = 10% = ~£17). Tightened to 0.08 in trending_dn regime.",
+    "minimum_capital":   "Formula: 0.0001 * BTC_price * levels / capital_pct / gbp_usd_rate. At BTC ~$73k: 4 levels @ 20% -> ~£115 min. Bot enforces this at runtime and alerts if breached."
   }
 }
