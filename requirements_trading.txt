@@ -3,7 +3,10 @@ httpx==0.27.0
 python-dotenv==1.0.1
 
 # Skill 1: CCXT — replaces hand-rolled cdx_client.py
-ccxt>=4.3.0
+# Pinned: 4.x changed crypto.com's order-book level shape (3-element levels)
+# and stopped clamping get-order-history limit. cdx_client.py handles both
+# defensively, but pin to the verified-working version to avoid surprises.
+ccxt==4.5.55
 
 # Skill 2: HMM regime detection — replaces static ATR/BBW thresholds
 hmmlearn>=0.3.2
