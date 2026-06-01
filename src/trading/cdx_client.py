@@ -193,8 +193,10 @@ class CDXClient:
             "best_ask":  best_ask,
             "mid_price": (best_bid + best_ask) / 2 if best_bid and best_ask else 0.0,
             "spread":    best_ask - best_bid,
-            "bids":      [[float(p), float(q)] for p, q in bids],
-            "asks":      [[float(p), float(q)] for p, q in asks],
+            # Some exchanges/ccxt versions return 3-element levels
+            # ([price, amount, count]); take the first two defensively.
+            "bids":      [[float(b[0]), float(b[1])] for b in bids],
+            "asks":      [[float(a[0]), float(a[1])] for a in asks],
         }
 
     def get_candlesticks(
