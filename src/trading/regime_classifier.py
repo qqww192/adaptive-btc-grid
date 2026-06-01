@@ -60,10 +60,24 @@ DATA_FILE         = ROOT / "data" / "regime.json"
 TREND_PAUSE_FLAG  = ROOT / "data" / "trend_pause.flag"
 INSTRUMENT        = "BTC_USDT"
 
-# Minimum HMM confidence required before activating the trend pause.
-# At lower confidence the signal is unreliable and pausing would forfeit
-# good ranging fills unnecessarily.
+# Minimum HMM confidence required before treating a trend as "confirmed".
+# At lower confidence the signal is unreliable.
 TREND_PAUSE_CONFIDENCE = 0.70
+
+# Hysteresis: number of *consecutive* 4-hourly classifications that must agree on
+# the same confirmed trend before we act on it. The 3-state HMM reports ≥0.70
+# posterior confidence on almost every daily candle, so a single read is not
+# enough — requiring 2 in a row (≈8h) stops the bot flip-flopping in and out of
+# trend handling on noise.
+TREND_CONFIRM_COUNT = 2
+
+
+def _read_prev_regime() -> dict:
+    """Read the previous regime.json (for the hysteresis streak). Empty on first run."""
+    try:
+        return json.loads(DATA_FILE.read_text()) if DATA_FILE.exists() else {}
+    except Exception:
+        return {}
 
 
 # ------------------------------------------------------------------ #
@@ -201,35 +215,38 @@ def classify_rules(atr: float, bbw: float, candles: list[dict]) -> str:
 REGIME_PARAMS = {
     # ranging: optimal for small capital — 1.0% spacing gives 0.50% net vs 0.30% at 0.8%
     # asymmetric 4:2 buy/sell skew; trend pause prevents operation during trending phases
+    # capital_pct values target the £170 / ~20%-active profile (4 levels keep
+    # order sizes above the exchange minimum at that size). Trends/volatile still
+    # deploy proportionally LESS than ranging, preserving the risk-off skew.
     "ranging": {
         "spacing_pct": 1.0,
         "range_pct":   5.0,
-        "levels":      6,
-        "capital_pct": 0.70,
+        "levels":      4,
+        "capital_pct": 0.20,
         "kill_pct":    0.10,
     },
-    # trending_up: grid continues only when HMM confidence < 0.70; wide spacing to ride swings
+    # trending_up: now TRADED (wider, skewed grid) rather than stood-aside; less capital
     "trending_up": {
         "spacing_pct": 1.4,
         "range_pct":   7.0,
-        "levels":      6,
-        "capital_pct": 0.55,
+        "levels":      4,
+        "capital_pct": 0.16,
         "kill_pct":    0.10,
     },
-    # trending_dn: reduced capital, tighter kill; grid runs only when confidence < 0.70
+    # trending_dn: least capital, tighter kill — reduce exposure into weakness
     "trending_dn": {
         "spacing_pct": 1.2,
         "range_pct":   5.0,
-        "levels":      6,
-        "capital_pct": 0.50,
+        "levels":      4,
+        "capital_pct": 0.15,
         "kill_pct":    0.08,
     },
     # volatile: widest spacing to survive large swings without recentering
     "volatile": {
         "spacing_pct": 1.6,
         "range_pct":   8.0,
-        "levels":      6,
-        "capital_pct": 0.60,
+        "levels":      4,
+        "capital_pct": 0.18,
         "kill_pct":    0.10,
     },
 }
@@ -290,58 +307,80 @@ def run() -> None:
         stance = "NEUTRAL"
     print(f"[regime] Stance: {stance} | Sentiment: {summarise(sentiment) or 'n/a'}")
 
-    # ── Trend / stand-aside pause flag ───────────────────────────────────────
-    # The flag tells grid_trader to stand aside entirely (avoiding recenter fee
-    # drag). It activates on a confirmed strong trend OR an AI STAND_ASIDE
-    # stance, and clears as soon as neither holds.
-    was_paused      = TREND_PAUSE_FLAG.exists()
-    is_strong_trend = (
-        regime in ("trending_up", "trending_dn")
+    # ── Confirmed-trend detection (with HMM+rule agreement and hysteresis) ────
+    # The grid used to stand aside *entirely* on any high-confidence HMM trend.
+    # Because the 3-state HMM reports ≥0.70 confidence on nearly every daily
+    # candle, that left the bot idle for most of a trending market (earning
+    # nothing and then whipsawing on the trailing stop). We now:
+    #   • require the rule-based classifier to AGREE it is the same trend, and
+    #   • require TREND_CONFIRM_COUNT consecutive agreeing reads (hysteresis),
+    # and a confirmed directional trend NO LONGER pauses the grid — instead
+    # grid_trader trades the wider, capital-reduced, direction-skewed trend grid
+    # (regime_classifier.REGIME_PARAMS, applied by grid_trader.apply_regime_params).
+    # A full stand-aside is now reserved for the explicit AI STAND_ASIDE stance.
+    rule_regime  = classify_rules(atr, bbw, candles)
+    directional  = regime in ("trending_up", "trending_dn")
+    this_trend_ok = (
+        directional
         and hmm_confidence >= TREND_PAUSE_CONFIDENCE
+        and rule_regime == regime          # HMM and rules agree on the same trend
     )
+    prev = _read_prev_regime()
+    if this_trend_ok and prev.get("regime") == regime:
+        trend_streak = int(prev.get("trend_streak", 0)) + 1
+    elif this_trend_ok:
+        trend_streak = 1
+    else:
+        trend_streak = 0
+    confirmed_trend = trend_streak >= TREND_CONFIRM_COUNT
+
+    was_paused   = TREND_PAUSE_FLAG.exists()
     stand_aside  = (stance == "STAND_ASIDE")
-    should_pause = is_strong_trend or stand_aside
+    should_pause = stand_aside            # directional trends no longer stand aside
     if should_pause:
         TREND_PAUSE_FLAG.parent.mkdir(parents=True, exist_ok=True)
         TREND_PAUSE_FLAG.touch()
-        reason = "strong trend" if is_strong_trend else "AI stance STAND_ASIDE"
-        print(f"[regime] Pause ACTIVATED ({reason}; {regime} conf={hmm_confidence:.2f}) "
-              f"— grid_trader will stand aside until conditions clear")
+        print(f"[regime] Pause ACTIVATED (AI stance STAND_ASIDE; {regime} "
+              f"conf={hmm_confidence:.2f}) — grid_trader will stand aside")
         if not was_paused:
-            if is_strong_trend:
-                direction = "uptrend" if regime == "trending_up" else "downtrend"
-                headline = f"strong {direction} detected"
-            else:
-                headline = "AI recommends standing aside"
             _send_telegram(
-                f"⏸ *Grid paused — {headline}*\n"
+                f"⏸ *Grid paused — AI recommends standing aside*\n"
                 f"Regime: `{regime}` (HMM {hmm_confidence:.0%} confident) · Stance: `{stance}`\n"
                 f"ATR: ${atr:,.0f} | BBW: {bbw * 100:.1f}%\n"
-                f"Standing aside to protect capital. Will resume when conditions clear."
+                f"Standing aside to protect capital. Will resume when the stance clears."
             )
     else:
         TREND_PAUSE_FLAG.unlink(missing_ok=True)
-        if regime in ("trending_up", "trending_dn"):
-            print(f"[regime] Trend detected but confidence too low ({hmm_confidence:.2f} < "
-                  f"{TREND_PAUSE_CONFIDENCE}) — grid continues")
+        if confirmed_trend:
+            direction = "uptrend" if regime == "trending_up" else "downtrend"
+            print(f"[regime] Confirmed {direction} (streak={trend_streak}, "
+                  f"conf={hmm_confidence:.2f}) — trading WIDER trend grid "
+                  f"(spacing={params['spacing_pct']}%, capital={params['capital_pct']})")
+        elif directional:
+            print(f"[regime] Trend detected but not confirmed "
+                  f"(streak={trend_streak}/{TREND_CONFIRM_COUNT}, conf={hmm_confidence:.2f}, "
+                  f"rules={rule_regime}) — grid continues at base params")
         if was_paused:
             _send_telegram(
-                f"▶️ *Grid resumed — conditions cleared*\n"
+                f"▶️ *Grid resumed — stand-aside cleared*\n"
                 f"Regime: `{regime}` (HMM {hmm_confidence:.0%} confident) · Stance: `{stance}`\n"
                 f"Grid is active again."
             )
 
     payload = json.dumps(
         {
-            "regime":         regime,
-            "hmm_available":  hmm_available,
-            "hmm_confidence": round(hmm_confidence, 3),
-            "atr":            round(atr, 2),
-            "bbw_pct":        round(bbw * 100, 2),
-            "recommended":    params,
-            "stance":         stance,
-            "sentiment":      sentiment,
-            "updated_at":     datetime.now(timezone.utc).isoformat(),
+            "regime":          regime,
+            "hmm_available":   hmm_available,
+            "hmm_confidence":  round(hmm_confidence, 3),
+            "atr":             round(atr, 2),
+            "bbw_pct":         round(bbw * 100, 2),
+            "recommended":     params,
+            "stance":          stance,
+            "rule_regime":     rule_regime,
+            "trend_streak":    trend_streak,
+            "confirmed_trend": confirmed_trend,
+            "sentiment":       sentiment,
+            "updated_at":      datetime.now(timezone.utc).isoformat(),
         },
         indent=2,
     )

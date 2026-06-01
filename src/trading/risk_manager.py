@@ -37,6 +37,12 @@ CONFIG_FILE = ROOT / "config" / "grid_params.json"
 
 _TOTAL_CAPITAL_GBP_DEFAULT = float(os.environ.get("TOTAL_CAPITAL_GBP", "150"))
 
+# Absolute floor for deployed capital fraction. Below this a grid is not worth
+# running (order sizes hit the exchange minimum). The CDaR step-down scales
+# relative to the base capital_pct so it works whether the owner runs the legacy
+# ~70% deployment or the £170 / 20%-active profile.
+MIN_CAPITAL_PCT = 0.10
+
 
 def _get_total_capital() -> float:
     """Read total_capital from config first, fall back to env var.
@@ -257,7 +263,10 @@ def get_dynamic_capital_pct(base_capital_pct: float = 0.70) -> float:
     and scales down deployment before the binary kill switch fires —
     giving the bot a softer landing.
 
-    Guaranteed to stay within [0.40, base_capital_pct].
+    The step-down is multiplicative on base_capital_pct (so it scales with any
+    deployment level) and is floored at MIN_CAPITAL_PCT. At the legacy base of
+    0.70 the multipliers reproduce the previous absolute steps (~0.39/0.55/0.60).
+    Guaranteed to stay within [MIN_CAPITAL_PCT, base_capital_pct].
     """
     try:
         from trading.trade_logger import read_since
@@ -280,18 +289,19 @@ def get_dynamic_capital_pct(base_capital_pct: float = 0.70) -> float:
     ratio    = cdar / kill_abs if kill_abs else 0.0
 
     if ratio > 0.80:
-        adjusted = max(0.40, base_capital_pct - 0.30)
+        adjusted = base_capital_pct * 0.55     # deepest cut as drawdown nears the kill line
     elif ratio > 0.50:
-        adjusted = max(0.55, base_capital_pct - 0.15)
+        adjusted = base_capital_pct * 0.78
     elif ratio > 0.30:
-        adjusted = max(0.60, base_capital_pct - 0.10)
+        adjusted = base_capital_pct * 0.85
     else:
         adjusted = base_capital_pct
+    adjusted = max(MIN_CAPITAL_PCT, adjusted)
 
     # Priority 4: apply extra step-down if AI guardian recommended reducing capital
     state = get_state()
-    if state.get("ai_reduce_cap") and adjusted > 0.50:
-        adjusted = max(0.50, adjusted - 0.10)
+    if state.get("ai_reduce_cap"):
+        adjusted = max(MIN_CAPITAL_PCT, adjusted * 0.85)
         print(f"[risk] AI guardian step-down applied → capital_pct={adjusted:.2f}")
 
     if adjusted < base_capital_pct:
