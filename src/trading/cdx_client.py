@@ -20,6 +20,11 @@ import ccxt
 
 CDX_TIMEOUT = 10_000  # CCXT uses milliseconds
 
+# crypto.com's private/get-order-history endpoint rejects limit > 100
+# ("Invalid limit", code 40003). Clamp defensively — fill detection never
+# needs more than the active grid's worth of recent orders anyway.
+_MAX_HISTORY_LIMIT = 100
+
 _TIMEFRAME_MAP = {
     "1D": "1d", "4h": "4h", "1h": "1h",
     "30m": "30m", "15m": "15m", "5m": "5m", "1m": "1m",
@@ -276,6 +281,7 @@ class CDXClient:
 
     def get_order_history(self, instrument: str, limit: int = 20) -> list[dict]:
         """Return recent order history (filled and cancelled)."""
+        limit = min(limit, _MAX_HISTORY_LIMIT)
         try:
             orders = self._call(
                 self._ex.fetch_closed_orders, self._sym(instrument), limit=limit
@@ -288,6 +294,7 @@ class CDXClient:
 
     def get_filled_orders_since(self, instrument: str, since_iso: str, limit: int = 200) -> list[dict]:
         """Return FILLED orders placed on or after since_iso (ISO timestamp string)."""
+        limit    = min(limit, _MAX_HISTORY_LIMIT)
         since_ms = int(datetime.fromisoformat(since_iso).timestamp() * 1000)
         try:
             orders = self._call(
